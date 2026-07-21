@@ -11,6 +11,13 @@
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
+  
+  <depend>xacro</depend>
+  <depend>urdf</depend>
+
+  <depend>dsr_description2</depend>
+  <depend>dsr_moveit_config_m0609</depend>
+  <depend>onrobot_rg_description</depend>
 
   <export>
     <build_type>ament_cmake</build_type>

@@ -40,3 +40,9 @@ collision_geometry:
     center_x: 0.000
     center_z: 0.1725
     y_sign: -1.0
+  
+  camera_mount:
+    enabled: true
+    center_local: [0.0, 0.060, -0.100]
+    size: [0.030, 0.100, 0.030]
+  

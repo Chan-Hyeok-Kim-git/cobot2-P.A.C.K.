@@ -11,6 +11,7 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(shape_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(moveit_msgs REQUIRED)
 find_package(moveit_ros_planning_interface REQUIRED)
@@ -19,6 +20,32 @@ find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(grasp_interfaces REQUIRED)
+
+add_executable(moveit_validator_node src/moveit_validator_node.cpp)
+ament_target_dependencies(moveit_validator_node
+  rclcpp
+  geometry_msgs
+  sensor_msgs
+  shape_msgs
+  visualization_msgs
+  moveit_msgs
+  moveit_ros_planning_interface
+  moveit_core
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+  grasp_interfaces
+)
+
+install(TARGETS
+  moveit_validator_node
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(
+  DIRECTORY launch config
+  DESTINATION share/${PROJECT_NAME}
+)
 
 
 
