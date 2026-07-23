@@ -74,8 +74,8 @@ JOINT_ACC = 30      # deg/s^2
 LIFT_HEIGHT_MM = 100.0
 
 # 실기에서 측정 후 수정
-BIN_JOINT_DEG = [0.0, -30.0, 120.0, 0.0, 90.0, 0.0]
-HOME_JOINT_DEG = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+BIN_JOINT_DEG = [0.0, 0.0, 90.0, 0.0, 90.0, 180.0]
+HOME_JOINT_DEG = [0.0, 0.0, 90.0, 0.0, 90.0, 180.0]
 
 
 class RobotExecutor(Node):
