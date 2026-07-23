@@ -87,8 +87,8 @@ class RobotExecutor(Node):
         self.declare_parameter('onrobot_ip', '192.168.1.1')
         self.declare_parameter('onrobot_port', 502)
         self.declare_parameter('onrobot_gripper', 'rg2')
-        self.declare_parameter('gripper_force_raw', 300)
-        self.declare_parameter('gripper_timeout_sec', 5.0)
+        self.declare_parameter('gripper_force_raw', 100)
+        self.declare_parameter('gripper_timeout_sec', 15.0)
         self.declare_parameter('gripper_poll_period_sec', 0.1)
         self.declare_parameter('gripper_open_margin_mm', 15.0)
         self.declare_parameter('gripper_min_open_clearance_mm', 3.0)
@@ -235,7 +235,7 @@ class RobotExecutor(Node):
                           grasp_abc[0], grasp_abc[1], grasp_abc[2])
         movel(lift_posx, vel=VELOCITY, acc=ACC)
 
-        movej(posj(*BIN_JOINT_DEG), vel=JOINT_VEL, acc=JOINT_ACC)
+        movel(posx(*BIN_JOINT_DEG), vel=VELOCITY, acc=ACC)
         wait(0.5)
 
         self._open_gripper_fully()

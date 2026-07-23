@@ -152,7 +152,8 @@ class FakeGraspCloudPublisher(Node):
 
     def build_scenario(self, scenario: str) -> tuple[np.ndarray, np.ndarray]:
         # base_link 기준 예시 물체. 실제 로봇의 IK 가능 영역에 맞게 center를 수정할 수 있다.
-        object_center = np.array([0.50, 0.10, 0.20], dtype=np.float32)
+        # ★ Global_ex 좌표 반영: posx(436.04, -190.5, 314.18, ...) [mm] -> [m]
+        object_center = np.array([0.43604, -0.19050, 0.31418], dtype=np.float32)
 
         if scenario == "clear":
             # x=60 mm, y=40 mm, z=100 mm: FRONT 파지 시 약 60 mm 개폐폭 예상

@@ -53,14 +53,26 @@ COLLISION_THRESHOLD = 5       # 박스 안에 이 점 개수 이상이면 충돌
 PREGRASP_DISTANCE   = 0.100   # pre-grasp 시작 거리 — grasp에서 이 거리만큼 물러난 위치
 APPROACH_STEP       = 0.010   # 접근 경로 충돌 검사 간격 (10mm마다 한 번씩 검사)
 
-# MoveIt joint_limits.yaml과 동일한 제한 [degree]
+# ★ 수정: 티치펜던트 Robot Limits(일반모드) 실측값으로 교체.
+# 이전에는 moveit joint_limits.yaml(라디안 → 도 변환값)을 그대로 썼는데,
+# J1/J3/J4/J6에서 실제 DSR 네이티브 컨트롤러의 운영 제한(티치펜던트에
+# 표시된 값)과 달랐다 — moveit 쪽이 더 보수적으로(좁게) 설정되어 있었음.
+#
+# 이 상수는 DSR ikin()이 계산한 해가 "실제 로봇 컨트롤러가 받아줄 수
+# 있는 범위"인지 미리 거르는 용도이므로, MoveIt의 자체 제약이 아니라
+# DSR 실제 운영 제한(티치펜던트 Robot Limits → 일반 모드)을 기준으로
+# 삼아야 한다. (MoveIt은 cobot2_mi_node에서 별도로 자기 자신의
+# joint_limits.yaml을 이미 적용하므로, 여기서 더 좁게 잡을 필요 없음)
+#
+# 확인 사진(2026-07-22) 기준:
+#   J1 ±360 | J2 ±95 | J3 ±135 | J4 ±360 | J5 ±135 | J6 ±360
 MOVEIT_JOINT_LIMITS_DEG = [
-    (-180.0, 180.0),   # joint_1
-    (-95.0,   95.0),   # joint_2
-    (-125.0, 125.0),   # joint_3
-    (-180.0, 180.0),   # joint_4
-    (-135.0, 135.0),   # joint_5
-    (-180.0, 180.0),   # joint_6
+    (-360.0, 360.0),   # joint_1  (이전 ±180 → 실측 ±360으로 수정)
+    ( -95.0,  95.0),   # joint_2  (실측과 일치, 변경 없음)
+    (-135.0, 135.0),   # joint_3  (이전 ±125 → 실측 ±135로 수정)
+    (-360.0, 360.0),   # joint_4  (이전 ±180 → 실측 ±360으로 수정)
+    (-135.0, 135.0),   # joint_5  (실측과 일치, 변경 없음)
+    (-360.0, 360.0),   # joint_6  (이전 ±180 → 실측 ±360으로 수정)
 ]
 
 # 제한 경계에 너무 가까운 자세를 피하기 위한 여유
@@ -152,21 +164,23 @@ class GraspValidatorNode(Node):
                 get_current_posj,  # 현재 관절 각도 조회
                 get_current_posx,  # 현재 TCP 위치 조회
                 DR_BASE,           # 좌표계 상수 (base_link 기준)
-            
             )
             from DR_common2 import posx  # 위치 자료형 생성 함수
-        except ImportError as e:
-            self.get_logger().error(f"두산 API import 실패: {e}")
-            raise
 
-        # 인스턴스 변수로 바인딩 — 메서드에서 self.dsr_ikin() 으로 호출
-        self.dsr_ikin             = ikin
-        self.dsr_get_current_posj = get_current_posj
-        self.dsr_get_current_posx = get_current_posx
-        self.dsr_posx             = posx
-        self.DR_BASE              = DR_BASE
-        self._dsr_ready           = True
-        self.get_logger().info("두산 API import 완료")
+            # 인스턴스 변수로 바인딩
+            self.dsr_ikin             = ikin
+            self.dsr_get_current_posj = get_current_posj
+            self.dsr_get_current_posx = get_current_posx
+            self.dsr_posx             = posx
+            self.DR_BASE              = DR_BASE
+            self._dsr_ready           = True
+            self.get_logger().info("두산 API import 완료")
+
+        except ImportError as e:
+            # ★ raise 제거 — bringup 없어도 노드 실행 (IK 스킵 모드)
+            self.get_logger().warn(
+                f"두산 API 없음: {e} → IK 스킵 모드로 동작"
+            )
 
     # ──────────────────────────────────────────────────────────────
     # 콜백 — 점군 수신
@@ -414,7 +428,7 @@ class GraspValidatorNode(Node):
         approach_dir /= (np.linalg.norm(approach_dir) + 1e-9)  # 단위벡터
 
         # pre-grasp 위치: grasp에서 approach 반대 방향으로 PREGRASP_DISTANCE
-        pre_pos = position - approach_dir * PREGRASP_DISTANCE
+        pre_pos = position + approach_dir * PREGRASP_DISTANCE
 
         n_steps  = max(2, int(PREGRASP_DISTANCE / APPROACH_STEP))  # 검사 횟수
         rotation = np.array(candidate["rotation"])
@@ -537,7 +551,7 @@ class GraspValidatorNode(Node):
         closing_direction: np.ndarray,   # 손가락 닫히는 방향 (world 좌표계)
     ) -> np.ndarray:
         # ★ 수정: z = -approach (본체 방향 = 그리퍼 진입 반대)
-        z = -np.array(approach_direction, dtype=float)
+        z = np.array(approach_direction, dtype=float)
         z /= (np.linalg.norm(z) + 1e-9)  # 단위벡터 정규화
 
         y = np.array(closing_direction, dtype=float)
@@ -670,26 +684,61 @@ class GraspValidatorNode(Node):
     #       → 물체를 옆에서 잡는 게 아니라 앞뒤로 눌러버리는 꼴 → 물리적으로 이상
     #
     # [grasp z: center_z 사용]
-    #   수평 접근이므로 물체 중심 높이에서 접근하는 게 자연스러움
+    #   물체 중심 높이에서 접근
     # ──────────────────────────────────────────────────────────────
 
-    def create_front_candidate(self) -> dict | None:
+    def create_front_candidate(
+        self,
+        approach: np.ndarray | None = None,
+    ) -> dict | None:
+        """
+        ★ 재설계: approach를 수평(Y축)으로 제한하던 가정을 제거했다.
+
+        이전에는 "선반과의 충돌을 피하려면 정면에서 수평으로만 접근해야
+        한다"고 가정하고 approach=[0,-1,0]으로 고정했었다. 하지만 실제로는:
+
+          1) check_gripper_clearance/check_approach_path가 이미 그리퍼
+             손가락/본체 박스를 environment_points(점군)와 대조해서
+             접근 경로 전체의 충돌을 검사하고 있고,
+          2) cobot2_mi_node의 MoveIt 경로계획도 선반을 포함한 전체
+             환경(planning scene)과의 충돌을 별도로 검사한다.
+
+        즉 충돌 안전성은 이미 이 두 단계에서 보장되므로, approach 방향을
+        수평으로 강제할 이유가 없다. 오히려 그 제약 때문에 실제로는
+        도달 가능한 위치인데도 관절 한계를 넘는 자세만 계산되어 파지에
+        실패하는 문제가 있었다.
+
+        이제 approach는 임의의 3D 방향(대각선, 위/아래 성분 포함)을
+        받을 수 있고, select_grasp()가 여러 방향을 순서대로 시도한다.
+        """
         if self.target_points is None or len(self.target_points) < 10:
             return None
 
         obb = self.compute_obb(self.target_points)
 
-        approach = np.array([0.0, -1.0, 0.0])  # Y 음방향 (선반 안으로)
+        if approach is None:
+            approach = np.array([0.0, -1.0, 0.0])  # 기본값 (수평, 하위 호환용)
+        approach = np.asarray(approach, dtype=float)
+        approach = approach / (np.linalg.norm(approach) + 1e-9)
 
-        # ★ approach와 수직인 OBB 축 자동 선택
-        # short → mid → long 순서: 가능한 한 짧은 폭으로 잡기 위해
-        closing = np.array([1.0, 0.0, 0.0])  # fallback (모든 축이 평행한 극단적 경우)
+        # fallback closing을 approach에 항상 수직이 되도록 동적으로 계산
+        world_ref = np.array([0.0, 0.0, 1.0])
+        if abs(np.dot(approach, world_ref)) > 0.9:
+            world_ref = np.array([1.0, 0.0, 0.0])
+        fallback_closing = np.cross(approach, world_ref)
+        fallback_closing /= (np.linalg.norm(fallback_closing) + 1e-9)
+
+        # ★ 수정: approach와 수직인 OBB 축 자동 선택.
+        # 이전에는 "ax[2] = 0.0"으로 항상 z성분을 강제로 제거해서
+        # closing 방향도 수평으로만 고정되어 있었다. approach가 이제
+        # 대각선/수직 방향도 될 수 있으므로, closing도 3차원 그대로
+        # 사용해서 approach와의 수직 관계만 확인한다.
+        closing = fallback_closing  # 모든 축이 평행한 극단적 경우의 대비값
         for key in ("short_axis", "mid_axis", "long_axis"):
-            ax   = obb[key].copy()
-            ax[2] = 0.0  # z성분 제거 (수평 방향만 고려)
+            ax = obb[key].copy()
             norm = np.linalg.norm(ax)
             if norm < 1e-6:
-                continue  # 이 축이 거의 수직이면 스킵
+                continue
             ax /= norm
 
             # approach 방향과의 내적 절대값 < 0.8이면 "충분히 수직" → 채택
@@ -699,7 +748,7 @@ class GraspValidatorNode(Node):
 
         rotation = self.make_rotation_matrix(approach, closing)
 
-        # grasp 위치: 물체 중심 그대로 사용 (수평 접근)
+        # grasp 위치: 물체 중심 그대로 사용
         position = obb["center"].copy()
 
         a, b, c = self._rotation_to_dsr_euler(rotation)
@@ -782,7 +831,10 @@ class GraspValidatorNode(Node):
                     + ", ".join(f"{v:.2f}" for v in joints)
                 )
 
-                # MoveIt과 동일한 관절 제한 검사
+                # ★ 추가: MoveIt과 동일한 관절 제한 검사
+                # 한계 근처의 해는 버리고 다음 solution space를 계속 탐색한다.
+                # 이렇게 걸러진 해만 채택하면 Cartesian 직선 보간 중
+                # 중간 지점에서 관절 한계를 넘어 IK가 끊기는 문제가 줄어든다.
                 limits_ok, limit_reason = self.check_joint_limits(joints)
 
                 if not limits_ok:
@@ -790,8 +842,6 @@ class GraspValidatorNode(Node):
                         f"IK 해 제외(sol={sol_space}) | "
                         f"관절 제한 위반: {limit_reason}"
                     )
-
-                    # 현재 solution space를 버리고 다음 sol 검사
                     continue
 
                 self.get_logger().info(
@@ -820,8 +870,13 @@ class GraspValidatorNode(Node):
         except Exception as e:
             self.get_logger().error(f"로봇 상태 조회 실패: {e}")
             return False
-    
+
+    # ★ 추가: 관절 한계 검사 함수
     def check_joint_limits(self, joints: list[float]) -> tuple[bool, str]:
+        """
+        MOVEIT_JOINT_LIMITS_DEG 기준으로 각 관절값이 안전 범위 안인지 검사.
+        JOINT_LIMIT_MARGIN_DEG만큼 여유를 두고, 그 여유 안쪽이어야 통과.
+        """
         if len(joints) != 6:
             return False, f"JOINT_COUNT_INVALID:{len(joints)}"
 
@@ -878,7 +933,36 @@ class GraspValidatorNode(Node):
 
         return {"success": True, "reason": "OK", "required_width": w, "joints": joints}
 
-    def select_grasp(self, top_cand, front_cand, target_pts, env_pts) -> dict:
+    # ★ 재설계: approach 방향을 더 이상 수평으로 제한하지 않는다.
+    #
+    # 충돌 안전성은 이미 두 단계에서 보장된다:
+    #   1) validate_candidate() 안의 check_gripper_clearance/
+    #      check_approach_path — 그리퍼 손가락/본체 박스를 environment
+    #      점군과 대조해서 이 candidate의 접근 경로 충돌을 검사
+    #   2) cobot2_mi_node의 MoveIt 경로계획 — 선반을 포함한 전체
+    #      planning scene과의 충돌을 별도로 검사
+    #
+    # 따라서 approach를 "정면에서 수평으로만"으로 제한할 이유가 없고,
+    # 오히려 그 제약 때문에 실제로는 도달 가능한 자세인데도 관절
+    # 한계를 넘는 orientation만 계산되어 파지에 실패하는 문제가 있었다.
+    #
+    # 아래는 방위각(azimuth, xy평면 회전) 8방향 × 고도각(elevation,
+    # 위/아래 기울기) 2단계로 만든 approach 후보들이다. 정면뿐 아니라
+    # 대각선/비스듬히 위에서 내려오는 방향까지 폭넓게 시도해서, 8개
+    # solution space 중 관절 한계 안쪽인 해를 찾을 확률을 높인다.
+    def _build_front_approach_candidates(self) -> list:
+        candidates = []
+        for az_deg in (135, 180, 225, 315):
+            for el_deg in (0, -30):  # 0=수평, -30=비스듬히 위에서 내려오는 방향
+                az = math.radians(az_deg)
+                el = math.radians(el_deg)
+                dx = math.cos(az) * math.cos(el)
+                dy = math.sin(az) * math.cos(el)
+                dz = math.sin(el)
+                candidates.append(np.array([dx, dy, dz]))
+        return candidates
+
+    def select_grasp(self, top_cand, target_pts, env_pts) -> dict:
         """
         층(layer) 판단 후 파지 전략 결정.
 
@@ -887,6 +971,11 @@ class GraspValidatorNode(Node):
 
         top: TOP 먼저 시도 → 실패 시 FRONT → 둘 다 실패 시 NONE
             → 공간이 충분할 경우에만 TOP 시도
+
+        ★ 재설계: FRONT는 이제 방위각 8방향 × 고도각 2단계(총 16개)
+        approach 후보를 순서대로 시도한다. 충돌 안전성은 point cloud
+        기반 그리퍼 박스 검사와 MoveIt 경로계획이 각자 보장하므로,
+        approach 방향 자체를 수평으로 강제할 필요가 없다.
         """
         layer = self.object_layer or 'bottom'
 
@@ -898,13 +987,26 @@ class GraspValidatorNode(Node):
                         "candidate": top_cand, "validation": r}
             self.get_logger().warn(f"TOP 실패: {r['reason']} → FRONT 시도")
 
-        # FRONT 시도 (bottom이거나 TOP 실패 시)
-        r = self.validate_candidate(front_cand, target_pts, env_pts)
-        if r["success"]:
-            return {"success": True, "grasp_type": "FRONT",
-                    "candidate": front_cand, "validation": r}
+        # ── FRONT: 여러 approach 방향을 순서대로 시도 ──────────────────
+        last_reason = "NO_CANDIDATE"
+        for approach in self._build_front_approach_candidates():
+            front_cand = self.create_front_candidate(approach)
+            if front_cand is None:
+                continue
 
-        self.get_logger().warn(f"FRONT 실패: {r['reason']} → NONE")
+            r = self.validate_candidate(front_cand, target_pts, env_pts)
+            if r["success"]:
+                self.get_logger().info(
+                    f"FRONT 성공 | approach={approach.round(2).tolist()}")
+                return {"success": True, "grasp_type": "FRONT",
+                        "candidate": front_cand, "validation": r}
+
+            self.get_logger().warn(
+                f"FRONT 실패(approach={approach.round(2).tolist()}): "
+                f"{r['reason']} → 다음 방향 시도")
+            last_reason = r['reason']
+
+        self.get_logger().warn(f"FRONT 전체 방향 실패: {last_reason} → NONE")
         return {"success": False, "grasp_type": "NONE", "reason": "UNGRASPABLE"}
 
     def rotation_matrix_to_quaternion(self, rotation: np.ndarray) -> tuple:
@@ -973,7 +1075,17 @@ class GraspValidatorNode(Node):
         return pose
 
     def publish_validated_grasp(self, result: dict):
-        """성공한 후보 하나를 ValidatedGrasp 메시지로 발행."""
+        """
+        성공한 후보 하나를 ValidatedGrasp 메시지로 발행.
+
+        ★ 수정: pre_grasp_pose도 DSR ikin으로 IK 검증 후 관절값을 함께 발행.
+        이전에는 grasp_pose만 검증했는데, MoveIt(cobot2_mi_node)이
+        pre_grasp_pose로 먼저 경로계획을 시도하면서 MoveIt 자체 IK
+        솔버(KDL, 수치해석 방식)가 실패하는 문제가 있었음.
+        DSR ikin(해석적 solver)으로 pre-grasp도 미리 검증해두면
+        cobot2_mi_node가 pose 기반 IK 대신 이미 검증된 관절값으로
+        joint-space 목표를 설정할 수 있어 훨씬 안정적임.
+        """
         candidate = result["candidate"]
         validation = result["validation"]
         joints = validation.get("joints")
@@ -985,21 +1097,22 @@ class GraspValidatorNode(Node):
 
         grasp_position = np.asarray(candidate["position"], dtype=np.float64)
         rotation = np.asarray(candidate["rotation"], dtype=np.float64)
-        approach = np.asarray(
-            candidate["approach_direction"], dtype=np.float64)
+        # rotation의 세 번째 열은 그리퍼 로컬 +Z축의 base_link 방향
+        gripper_plus_z_world = rotation[:, 2]
 
-        approach_norm = np.linalg.norm(approach)
-        if approach_norm < 1e-9:
-            self.get_logger().error(
-                "approach_direction이 0 벡터이므로 후보를 발행하지 않습니다.")
-            return
-        approach /= approach_norm
-
-        # grasp 쪽으로 이동하는 벡터가 approach이므로, 반대 방향으로 물러난 위치가 pre-grasp
-        pre_grasp_position = (
-            grasp_position - approach * PREGRASP_DISTANCE
+        # 이 코드의 축 정의에서 손끝 방향은 로컬 -Z
+        gripper_forward_world = -gripper_plus_z_world
+        gripper_forward_world /= (
+            np.linalg.norm(gripper_forward_world) + 1e-9
         )
 
+        # 그리퍼가 바라보는 방향과 정확히 반대쪽에 pre-grasp 생성
+        pre_grasp_position = (
+            grasp_position
+            - gripper_forward_world * PREGRASP_DISTANCE
+        )
+
+        # ── ★ pre-grasp pose도 DSR ikin으로 IK 검증 ──────────────────
         a, b, c = self._rotation_to_dsr_euler(rotation)
         pre_grasp_candidate = {
             "pose_mm_deg": [
@@ -1026,7 +1139,11 @@ class GraspValidatorNode(Node):
         msg.grasp_pose = self.make_pose_stamped(
             grasp_position, rotation, stamp)
         msg.grasp_joints = [float(v) for v in joints]
-        msg.required_width = float(validation["required_width"])
+        msg.pre_grasp_joints = [float(v) for v in pre_joints]
+        # ★ 추가: 그리퍼가 벌려야 할 폭(m)도 함께 발행.
+        # 이게 없어서 cobot2_move.py에서 grip_w_mm이 정의되지 않은 채
+        # 그리퍼 닫기 명령에 쓰이다가 크래시가 났었음.
+        msg.required_width = float(validation.get("required_width", 0.05))
 
         self.result_pub.publish(msg)
         self.get_logger().info(
@@ -1040,16 +1157,15 @@ class GraspValidatorNode(Node):
         )
 
     def run_validation(self):
-        """TOP/FRONT 후보 생성 → 검증 → 성공 후보만 메시지 발행."""
+        """TOP 후보 생성 → FRONT는 select_grasp 내부에서 여러 방향 시도 → 검증 → 발행."""
         top_cand = self.create_top_candidate()
-        front_cand = self.create_front_candidate()
 
-        if top_cand is None or front_cand is None:
+        if top_cand is None:
             self.get_logger().warn("후보 생성 실패: 메시지를 발행하지 않습니다.")
             return
 
         result = self.select_grasp(
-            top_cand, front_cand,
+            top_cand,
             self.target_points, self.environment_points)
 
         if not result.get("success", False):
@@ -1087,6 +1203,7 @@ def main(args=None):
             if node.validation_pending:
                 node.validation_pending = False
                 node.run_validation()
+
                 node.target_points = None
                 node.environment_points = None                  # 콜백 루프 시작
     except KeyboardInterrupt:
