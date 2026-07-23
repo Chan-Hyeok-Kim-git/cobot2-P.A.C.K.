@@ -1,0 +1,35 @@
+grasp_execution_coordinator:
+  ros__parameters:
+    # 입력
+    validated_grasp_topic: /grasp_validation/results
+    validate_and_plan_service: /validate_and_plan
+
+    # 로봇 실행 (moveit.launch.py / bringup.launch.py 와 이름 일치시킬 것)
+    namespace: dsr01
+    arm_controller_action: dsr_moveit_controller/follow_joint_trajectory
+    joint_names:
+      - joint_1
+      - joint_2
+      - joint_3
+      - joint_4
+      - joint_5
+      - joint_6
+
+    # 그리퍼 (onrobot_rg_control 실제 서비스)
+    gripper_command_service: /onrobot/sendCommand
+    gripper_open_width_m: 0.105        # rg2_collision.yaml usable_max_opening
+    gripper_close_margin_m: 0.0        # required_width 그대로 사용 (여유는 candidate 쪽에서 이미 포함)
+
+    # 동작 파라미터
+    lift_height_m: 0.10
+    post_grasp_settle_sec: 0.3
+
+    # 수납함(비상가방 적재함) 이동 - 고정 관절 목표 (실측 후 갱신 필요)
+    bin_joint_positions_rad: [0.0, -0.3, 1.2, 0.0, 1.6, 0.0]
+    home_joint_positions_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    trajectory_time_to_bin_sec: 4.0
+    trajectory_time_to_home_sec: 4.0
+
+    # 서비스 타임아웃
+    service_wait_timeout_sec: 5.0
+    action_wait_timeout_sec: 5.0

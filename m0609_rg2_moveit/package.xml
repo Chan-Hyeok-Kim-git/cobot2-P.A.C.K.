@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>m0609_rg2_moveit</name>
+  <version>0.0.1</version>
+  <description>MoveIt2 config package for Doosan M0609 with OnRobot RG2 gripper</description>
+  <maintainer email="your@email.com">your_name</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- 브링업 패키지 의존성 -->
+  <exec_depend>m0609_rg2_bringup</exec_depend>
+
+  <!-- MoveIt2 핵심 -->
+  <exec_depend>moveit_ros_move_group</exec_depend>
+  <exec_depend>moveit_ros_planning_interface</exec_depend>
+  <exec_depend>moveit_kinematics</exec_depend>
+
+  <!-- IK 솔버 -->
+  <exec_depend>kdl_parser</exec_depend>
+
+  <!-- 경로 계획 플러그인 -->
+  <exec_depend>moveit_planners_ompl</exec_depend>
+
+  <!-- 기본 노드 -->
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>joint_state_publisher</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>xacro</exec_depend>
+
+  <!-- 참조 패키지 -->
+  <exec_depend>dsr_description2</exec_depend>
+  <exec_depend>onrobot_rg_description</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

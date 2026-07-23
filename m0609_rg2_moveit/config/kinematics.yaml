@@ -1,0 +1,11 @@
+# [원본] M0609 manipulator IK 설정
+manipulator:
+  kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
+  kinematics_solver_search_resolution: 0.005
+  kinematics_solver_timeout: 0.015
+
+# [추가] RG2 그리퍼는 단순 관절 제어라 IK 불필요 → position_kinematics 사용
+gripper:
+  kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
+  kinematics_solver_search_resolution: 0.005
+  kinematics_solver_timeout: 0.015
