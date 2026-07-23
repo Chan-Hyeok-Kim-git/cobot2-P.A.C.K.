@@ -1,6 +1,0 @@
-int64 scene_id
-GraspCandidate[] candidates
----
-bool success
-string failure_reason
-ValidatedGrasp[] results
