@@ -112,20 +112,43 @@ class FakeGraspCloudPublisher(Node):
 
         self.declare_parameter("scenario", "clear")
         self.declare_parameter("publish_period", 1.0)
+        # ★ 추가: 기본값을 "한 번만 발행"으로 변경.
+        # 이전에는 publish_period(기본 1초)마다 계속 재발행해서,
+        # cobot2_grasp.py가 같은 물체를 매번 "새 물체"로 착각하고
+        # 처음부터 다시 계산 → cobot2_move 큐에 같은 동작이 계속
+        # 쌓이는 문제가 있었다(로봇이 목표에 도달했다가 다시 같은
+        # 동작을 무한 반복하는 것처럼 보였던 원인).
+        # repeat:=true로 주면 기존처럼 반복 발행도 가능.
+        self.declare_parameter("repeat", False)
 
         self.scenario = str(self.get_parameter("scenario").value)
         period = float(self.get_parameter("publish_period").value)
+        self.repeat = bool(self.get_parameter("repeat").value)
 
         self.target_pub = self.create_publisher(PointCloud2, TARGET_TOPIC, 10)
         self.environment_pub = self.create_publisher(PointCloud2, ENVIRONMENT_TOPIC, 10)
 
         self.target_points, self.environment_points = self.build_scenario(self.scenario)
-        self.timer = self.create_timer(period, self.publish_clouds)
 
-        self.get_logger().info(
-            f"가짜 점군 발행 시작 | scenario={self.scenario} | "
-            f"target={len(self.target_points)}점 | environment={len(self.environment_points)}점"
-        )
+        if self.repeat:
+            self.timer = self.create_timer(period, self.publish_clouds)
+            self.get_logger().info(
+                f"가짜 점군 발행 시작(반복 모드, {period}초 간격) | scenario={self.scenario} | "
+                f"target={len(self.target_points)}점 | environment={len(self.environment_points)}점"
+            )
+        else:
+            # 1회만 발행 — 로봇이 하나의 목표를 향해 끝까지 동작을
+            # 완료할 수 있도록, 재발행으로 인한 중복 계산/명령을 없앤다.
+            self.timer = self.create_timer(0.5, self._publish_once_then_stop)
+            self.get_logger().info(
+                f"가짜 점군 1회 발행 예정 | scenario={self.scenario} | "
+                f"target={len(self.target_points)}점 | environment={len(self.environment_points)}점"
+            )
+
+    def _publish_once_then_stop(self) -> None:
+        self.timer.cancel()
+        self.publish_clouds()
+        self.get_logger().info("1회 발행 완료 — 재발행 없음 (repeat:=true로 반복 가능)")
 
     def build_scenario(self, scenario: str) -> tuple[np.ndarray, np.ndarray]:
         # base_link 기준 예시 물체. 실제 로봇의 IK 가능 영역에 맞게 center를 수정할 수 있다.
