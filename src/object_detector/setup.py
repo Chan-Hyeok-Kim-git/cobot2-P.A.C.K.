@@ -22,8 +22,9 @@ setup(
     zip_safe=True,
     maintainer="Rokey Team",
     maintainer_email="rokey@example.com",
-    description="Real-time YOLO detector for ROS 2 camera images",
+    description="YOLO detection and RGB-D segmentation point clouds for ROS 2",
     license="Apache-2.0",
+    tests_require=["pytest"],
     entry_points={
         "console_scripts": [
             "yolo_detector = object_detector.yolo_detector_node:main",

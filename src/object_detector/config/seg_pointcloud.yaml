@@ -1,0 +1,44 @@
+yolo_pointcloud:
+  ros__parameters:
+    # Runtime and input topics
+    model_path: ""
+    device: "cpu"
+    color_topic: "/camera/camera/color/image_raw"
+    depth_topic: "/camera/camera/aligned_depth_to_color/image_raw"
+    camera_info_topic: "/camera/camera/color/camera_info"
+    width: 640
+    height: 480
+    sync_slop_sec: 0.08
+    torch_num_threads: 2
+
+    # Output topics
+    points_topic: "/ai/object_points"
+    background_points_topic: "/ai/background_points"
+    objects_topic: "/ai/objects_3d/json"
+    markers_topic: "/ai/objects_3d/markers"
+    annotated_topic: "/ai/detections_3d/image"
+
+    # YOLO segmentation
+    confidence: 0.4
+    iou: 0.7
+    image_size: 640
+
+    # Depth filtering and object cloud sampling
+    depth_scale: 0.001
+    min_depth: 0.15
+    max_depth: 3.0
+    depth_band: 0.05
+    mask_erode_px: 3
+    point_stride: 2
+    min_valid_ratio: 0.3
+    min_object_points: 20
+    max_points_per_object: 5000
+
+    # Background cloud generation
+    publish_background_points: true
+    background_exclusion_mode: "all"
+    target_class: ""
+    target_class_topic: "/ai/target_class"
+    background_mask_dilate_px: 5
+    background_point_stride: 4
+    max_background_points: 20000

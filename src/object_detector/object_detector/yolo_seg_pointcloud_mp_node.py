@@ -15,44 +15,64 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from std_msgs.msg import Header, String
 from visualization_msgs.msg import Marker, MarkerArray
 
-
-def pack_rgb(rgb):
-    r, g, b = (int(value) for value in rgb)
-    return (r << 16) | (g << 8) | b
-
-
-def erode_mask(mask, pixels):
-    binary = mask > 0
-    if pixels <= 0:
-        return binary
-    size = pixels * 2 + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
-    return cv2.erode(binary.astype(np.uint8), kernel).astype(bool)
+from object_detector.ros_message_utils import create_bgr8_image, create_pointcloud2
+from object_detector.segmentation_utils import (
+    dilate_mask,
+    evenly_limit_samples,
+    erode_mask,
+    project_depth_samples,
+    select_representative_sample,
+)
 
 
-def dilate_mask(mask, pixels):
-    """Expand a segmentation mask to keep boundary pixels out of the scene cloud."""
-    binary = mask > 0
-    if pixels <= 0:
-        return binary
-    size = pixels * 2 + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
-    return cv2.dilate(binary.astype(np.uint8), kernel).astype(bool)
-
-
-def select_representative_sample(points, pixels):
-    """Return an actual depth sample nearest the coordinate-wise point median."""
-    if not len(points):
-        return None, None, None
-    median_xyz = np.median(points, axis=0)
-    nearest = int(np.argmin(np.sum((points - median_xyz) ** 2, axis=1)))
-    xyz = points[nearest]
-    pixel_uv = [int(pixels[nearest, 0]), int(pixels[nearest, 1])]
-    return xyz, pixel_uv, float(xyz[2])
+NODE_PARAMETERS = {
+    "model_path": "",
+    "color_topic": "/camera/camera/color/image_raw",
+    "depth_topic": "/camera/camera/aligned_depth_to_color/image_raw",
+    "camera_info_topic": "/camera/camera/color/camera_info",
+    "points_topic": "/ai/object_points",
+    "background_points_topic": "/ai/background_points",
+    "objects_topic": "/ai/objects_3d/json",
+    "markers_topic": "/ai/objects_3d/markers",
+    "annotated_topic": "/ai/detections_3d/image",
+    "target_class_topic": "/ai/target_class",
+    "confidence": 0.4,
+    "iou": 0.7,
+    "image_size": 640,
+    "device": "cpu",
+    "depth_scale": 0.001,
+    "min_depth": 0.15,
+    "max_depth": 3.0,
+    "depth_band": 0.05,
+    "mask_erode_px": 3,
+    "point_stride": 2,
+    "publish_background_points": True,
+    "background_exclusion_mode": "all",
+    "target_class": "",
+    "background_mask_dilate_px": 5,
+    "background_point_stride": 4,
+    "max_background_points": 20000,
+    "min_valid_ratio": 0.3,
+    "min_object_points": 20,
+    "max_points_per_object": 5000,
+    "sync_slop_sec": 0.08,
+    "torch_num_threads": 2,
+    "width": 640,
+    "height": 480,
+}
+VALID_BACKGROUND_EXCLUSION_MODES = {"all", "class", "none"}
+BINARY_PAYLOAD_KEYS = {
+    "annotated",
+    "points",
+    "colors",
+    "class_ids",
+    "background_points",
+    "background_colors",
+}
 
 
 def inference_worker(input_queue, output_queue, frame_busy, config):
@@ -163,21 +183,16 @@ def inference_worker(input_queue, output_queue, frame_busy, config):
                             grid = np.zeros_like(valid)
                             grid[::stride, ::stride] = True
                             valid &= grid
-                        ys, xs = np.nonzero(valid)
-                        zs = depth_m[ys, xs].astype(np.float32)
-                        points = np.column_stack(
-                            ((xs - cx) * zs / fx, (ys - cy) * zs / fy, zs)
-                        ).astype(np.float32)
+                        points, pixels = project_depth_samples(
+                            depth_m, valid, (fx, fy, cx, cy)
+                        )
+                        xs = pixels[:, 0]
+                        ys = pixels[:, 1]
                         colors = color[ys, xs][:, ::-1].copy()
-                        pixels = np.column_stack((xs, ys)).astype(np.int32)
                         max_points = config["max_points_per_object"]
-                        if max_points > 0 and len(points) > max_points:
-                            selected = np.linspace(
-                                0, len(points) - 1, max_points, dtype=np.int64
-                            )
-                            points = points[selected]
-                            colors = colors[selected]
-                            pixels = pixels[selected]
+                        points, colors, pixels = evenly_limit_samples(
+                            max_points, points, colors, pixels
+                        )
                         status = (
                             "success"
                             if len(points) >= config["min_object_points"]
@@ -218,7 +233,11 @@ def inference_worker(input_queue, output_queue, frame_busy, config):
                     ),
                     "median_depth_m": None if median_depth is None else round(median_depth, 6),
                     "valid_depth_ratio": round(valid_ratio, 6),
-                    "position_camera_xyz_m": None if xyz is None else [round(float(v), 6) for v in xyz],
+                    "position_camera_xyz_m": (
+                        None
+                        if xyz is None
+                        else [round(float(value), 6) for value in xyz]
+                    ),
                     "mask_pixel_count": mask_pixels,
                     "object_point_count": len(points),
                     "status": status,
@@ -243,25 +262,16 @@ def inference_worker(input_queue, output_queue, frame_busy, config):
                     sampling_grid = np.zeros_like(background_valid)
                     sampling_grid[::background_stride, ::background_stride] = True
                     background_valid &= sampling_grid
-                ys, xs = np.nonzero(background_valid)
-                zs = depth_m[ys, xs].astype(np.float32)
-                background_points = np.column_stack(
-                    ((xs - cx) * zs / fx, (ys - cy) * zs / fy, zs)
-                ).astype(np.float32)
+                background_points, background_pixels = project_depth_samples(
+                    depth_m, background_valid, (fx, fy, cx, cy)
+                )
+                xs = background_pixels[:, 0]
+                ys = background_pixels[:, 1]
                 background_colors = color[ys, xs][:, ::-1].copy()
                 max_background_points = int(config["max_background_points"])
-                if (
-                    max_background_points > 0
-                    and len(background_points) > max_background_points
-                ):
-                    selected = np.linspace(
-                        0,
-                        len(background_points) - 1,
-                        max_background_points,
-                        dtype=np.int64,
-                    )
-                    background_points = background_points[selected]
-                    background_colors = background_colors[selected]
+                background_points, background_colors = evenly_limit_samples(
+                    max_background_points, background_points, background_colors
+                )
 
             payload = {
                 "stamp": item["stamp"],
@@ -269,9 +279,21 @@ def inference_worker(input_queue, output_queue, frame_busy, config):
                 "inference_ms": round((time.perf_counter() - started) * 1000.0, 3),
                 "objects": objects,
                 "annotated": annotated,
-                "points": np.concatenate(point_parts) if point_parts else np.empty((0, 3), dtype=np.float32),
-                "colors": np.concatenate(color_parts) if color_parts else np.empty((0, 3), dtype=np.uint8),
-                "class_ids": np.concatenate(class_parts) if class_parts else np.empty((0,), dtype=np.uint16),
+                "points": (
+                    np.concatenate(point_parts)
+                    if point_parts
+                    else np.empty((0, 3), dtype=np.float32)
+                ),
+                "colors": (
+                    np.concatenate(color_parts)
+                    if color_parts
+                    else np.empty((0, 3), dtype=np.uint8)
+                ),
+                "class_ids": (
+                    np.concatenate(class_parts)
+                    if class_parts
+                    else np.empty((0,), dtype=np.uint16)
+                ),
                 "background_points": background_points,
                 "background_colors": background_colors,
                 "background_exclusion_mode": exclusion_mode,
@@ -295,34 +317,10 @@ def inference_worker(input_queue, output_queue, frame_busy, config):
 class YoloSegPointCloudMpNode(Node):
     def __init__(self):
         super().__init__("yolo_pointcloud")
-        defaults = {
-            "model_path": "",
-            "color_topic": "/camera/camera/color/image_raw",
-            "depth_topic": "/camera/camera/aligned_depth_to_color/image_raw",
-            "camera_info_topic": "/camera/camera/color/camera_info",
-            "points_topic": "/ai/object_points",
-            "background_points_topic": "/ai/background_points",
-            "objects_topic": "/ai/objects_3d/json",
-            "markers_topic": "/ai/objects_3d/markers",
-            "annotated_topic": "/ai/detections_3d/image",
-            "target_class_topic": "/ai/target_class",
-            "confidence": 0.4, "iou": 0.7, "image_size": 640,
-            "device": "cpu", "depth_scale": 0.001,
-            "min_depth": 0.15, "max_depth": 3.0, "depth_band": 0.05,
-            "mask_erode_px": 3, "point_stride": 2,
-            "publish_background_points": True,
-            "background_exclusion_mode": "all", "target_class": "",
-            "background_mask_dilate_px": 5, "background_point_stride": 4,
-            "max_background_points": 20000,
-            "min_valid_ratio": 0.3, "min_object_points": 20,
-            "max_points_per_object": 5000,
-            "sync_slop_sec": 0.08, "torch_num_threads": 2,
-            "width": 640, "height": 480,
-        }
-        for name, value in defaults.items():
+        for name, value in NODE_PARAMETERS.items():
             self.declare_parameter(name, value)
         exclusion_mode = str(self.p("background_exclusion_mode")).strip().lower()
-        if exclusion_mode not in ("all", "class", "none"):
+        if exclusion_mode not in VALID_BACKGROUND_EXCLUSION_MODES:
             raise ValueError(
                 "background_exclusion_mode must be one of: all, class, none"
             )
@@ -335,7 +333,10 @@ class YoloSegPointCloudMpNode(Node):
         self.latest_depth = None
         self.latest_info = None
         self.target_class = str(self.p("target_class")).strip()
-        self.color_count = self.depth_count = self.processed_count = self.queued_count = 0
+        self.color_count = 0
+        self.depth_count = 0
+        self.queued_count = 0
+        self.published_count = 0
         self.mp_context = mp.get_context("spawn")
         self.input_queue = self.mp_context.Queue(maxsize=1)
         self.output_queue = self.mp_context.Queue(maxsize=1)
@@ -350,7 +351,7 @@ class YoloSegPointCloudMpNode(Node):
         )
         self.color_buffer = np.ndarray(color_shape, dtype=np.uint8, buffer=self.color_shm.buf)
         self.depth_buffer = np.ndarray(depth_shape, dtype=np.float32, buffer=self.depth_shm.buf)
-        config = {name: self.p(name) for name in defaults}
+        config = {name: self.p(name) for name in NODE_PARAMETERS}
         config["model_path"] = str(Path(config["model_path"]).expanduser())
         config["color_shape"] = color_shape
         config["depth_shape"] = depth_shape
@@ -442,12 +443,17 @@ class YoloSegPointCloudMpNode(Node):
         with self.frame_busy.get_lock():
             if self.frame_busy.value:
                 return
-        delta = abs(self.stamp_seconds(message.header.stamp) - self.stamp_seconds(self.latest_depth.header.stamp))
+        delta = abs(
+            self.stamp_seconds(message.header.stamp)
+            - self.stamp_seconds(self.latest_depth.header.stamp)
+        )
         if delta > float(self.p("sync_slop_sec")):
             return
         try:
             color = self.bridge.imgmsg_to_cv2(message, desired_encoding="bgr8")
-            depth = self.bridge.imgmsg_to_cv2(self.latest_depth, desired_encoding="passthrough").astype(np.float32)
+            depth = self.bridge.imgmsg_to_cv2(
+                self.latest_depth, desired_encoding="passthrough"
+            ).astype(np.float32)
         except CvBridgeError as error:
             self.get_logger().error(f"Image conversion failed: {error}")
             return
@@ -463,7 +469,10 @@ class YoloSegPointCloudMpNode(Node):
         self.depth_buffer[:] = depth
         item = {
             "intrinsics": (info.k[0], info.k[4], info.k[2], info.k[5]),
-            "stamp": {"sec": message.header.stamp.sec, "nanosec": message.header.stamp.nanosec},
+            "stamp": {
+                "sec": message.header.stamp.sec,
+                "nanosec": message.header.stamp.nanosec,
+            },
             "frame_id": message.header.frame_id,
             "target_class": self.target_class,
         }
@@ -488,134 +497,98 @@ class YoloSegPointCloudMpNode(Node):
         header.stamp.sec = payload["stamp"]["sec"]
         header.stamp.nanosec = payload["stamp"]["nanosec"]
         header.frame_id = payload["frame_id"]
-        fields = [
-            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
-            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
-            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
-            PointField(name="rgb", offset=12, datatype=PointField.UINT32, count=1),
-            PointField(name="class_id", offset=16, datatype=PointField.UINT16, count=1),
-        ]
-        points = payload["points"].astype(np.float32, copy=False)
-        colors = payload["colors"].astype(np.uint32, copy=False)
-        classes = payload["class_ids"].astype(np.uint16, copy=False)
-        packed_rgb = (
-            (colors[:, 0] << 16) | (colors[:, 1] << 8) | colors[:, 2]
-            if len(colors) else np.empty((0,), dtype=np.uint32)
+        self.points_pub.publish(
+            create_pointcloud2(
+                header,
+                payload["points"],
+                payload["colors"],
+                payload["class_ids"],
+            )
         )
-        dtype = np.dtype({
-            "names": ["x", "y", "z", "rgb", "class_id"],
-            "formats": ["<f4", "<f4", "<f4", "<u4", "<u2"],
-            "offsets": [0, 4, 8, 12, 16],
-            "itemsize": 18,
-        })
-        cloud_array = np.empty(len(points), dtype=dtype)
-        if len(points):
-            cloud_array["x"] = points[:, 0]
-            cloud_array["y"] = points[:, 1]
-            cloud_array["z"] = points[:, 2]
-            cloud_array["rgb"] = packed_rgb
-            cloud_array["class_id"] = classes
-        cloud_msg = PointCloud2()
-        cloud_msg.header = header
-        cloud_msg.height = 1
-        cloud_msg.width = len(points)
-        cloud_msg.fields = fields
-        cloud_msg.is_bigendian = False
-        cloud_msg.point_step = dtype.itemsize
-        cloud_msg.row_step = dtype.itemsize * len(points)
-        cloud_msg.data = cloud_array.tobytes()
-        cloud_msg.is_dense = bool(np.isfinite(points).all())
-        self.points_pub.publish(cloud_msg)
+        self.background_points_pub.publish(
+            create_pointcloud2(
+                header,
+                payload["background_points"],
+                payload["background_colors"],
+            )
+        )
 
-        background_points = payload["background_points"].astype(np.float32, copy=False)
-        background_colors = payload["background_colors"].astype(np.uint32, copy=False)
-        background_packed_rgb = (
-            (background_colors[:, 0] << 16)
-            | (background_colors[:, 1] << 8)
-            | background_colors[:, 2]
-            if len(background_colors)
-            else np.empty((0,), dtype=np.uint32)
-        )
-        background_dtype = np.dtype({
-            "names": ["x", "y", "z", "rgb"],
-            "formats": ["<f4", "<f4", "<f4", "<u4"],
-            "offsets": [0, 4, 8, 12],
-            "itemsize": 16,
-        })
-        background_array = np.empty(len(background_points), dtype=background_dtype)
-        if len(background_points):
-            background_array["x"] = background_points[:, 0]
-            background_array["y"] = background_points[:, 1]
-            background_array["z"] = background_points[:, 2]
-            background_array["rgb"] = background_packed_rgb
-        background_msg = PointCloud2()
-        background_msg.header = header
-        background_msg.height = 1
-        background_msg.width = len(background_points)
-        background_msg.fields = fields[:4]
-        background_msg.is_bigendian = False
-        background_msg.point_step = background_dtype.itemsize
-        background_msg.row_step = background_dtype.itemsize * len(background_points)
-        background_msg.data = background_array.tobytes()
-        background_msg.is_dense = bool(np.isfinite(background_points).all())
-        self.background_points_pub.publish(background_msg)
-
-        binary_payload_keys = (
-            "annotated", "points", "colors", "class_ids",
-            "background_points", "background_colors",
-        )
         objects_payload = {
-            key: value for key, value in payload.items()
-            if key not in binary_payload_keys
+            key: value
+            for key, value in payload.items()
+            if key not in BINARY_PAYLOAD_KEYS
         }
-        self.objects_pub.publish(String(data=json.dumps(objects_payload, ensure_ascii=False)))
-        annotated = np.ascontiguousarray(payload["annotated"], dtype=np.uint8)
-        image_msg = Image()
-        image_msg.header = header
-        image_msg.height = annotated.shape[0]
-        image_msg.width = annotated.shape[1]
-        image_msg.encoding = "bgr8"
-        image_msg.is_bigendian = False
-        image_msg.step = annotated.shape[1] * 3
-        image_msg.data = annotated.tobytes()
-        self.annotated_pub.publish(image_msg)
+        self.objects_pub.publish(
+            String(data=json.dumps(objects_payload, ensure_ascii=False))
+        )
+        self.annotated_pub.publish(create_bgr8_image(header, payload["annotated"]))
         self.publish_markers(header, payload["objects"])
-        self.processed_count += 1
+        self.published_count += 1
 
     def publish_markers(self, header, objects):
         array = MarkerArray()
-        clear = Marker(); clear.header = header; clear.action = Marker.DELETEALL
+        clear = Marker()
+        clear.header = header
+        clear.action = Marker.DELETEALL
         array.markers.append(clear)
         marker_id = 0
         for obj in objects:
             xyz = obj["position_camera_xyz_m"]
             if xyz is None:
                 continue
-            sphere = Marker(); sphere.header = header; sphere.ns = "object_centers"; sphere.id = marker_id
-            sphere.type = Marker.SPHERE; sphere.action = Marker.ADD
-            sphere.pose.position.x, sphere.pose.position.y, sphere.pose.position.z = xyz
-            sphere.pose.orientation.w = 1.0
-            sphere.scale.x = sphere.scale.y = sphere.scale.z = 0.035
-            sphere.color.r, sphere.color.g, sphere.color.b, sphere.color.a = 0.1, 1.0, 0.1, 1.0
-            array.markers.append(sphere); marker_id += 1
-            text = Marker(); text.header = header; text.ns = "object_labels"; text.id = marker_id
-            text.type = Marker.TEXT_VIEW_FACING; text.action = Marker.ADD
-            text.pose.position.x, text.pose.position.y, text.pose.position.z = xyz
-            text.pose.position.y -= 0.025; text.pose.orientation.w = 1.0
-            text.scale.z = 0.022; text.color.r = text.color.g = text.color.b = text.color.a = 1.0
-            pixel = obj.get("representative_pixel_uv")
-            depth = obj.get("representative_depth_m")
-            if pixel is not None and depth is not None:
-                text.text = f"{obj['class_name']} ({pixel[0]},{pixel[1]}) {depth:.3f}m"
-            else:
-                text.text = f"{obj['class_name']} {xyz[2]:.3f}m"
-            array.markers.append(text); marker_id += 1
+            array.markers.append(self.create_center_marker(header, marker_id, xyz))
+            marker_id += 1
+            array.markers.append(
+                self.create_label_marker(header, marker_id, xyz, obj)
+            )
+            marker_id += 1
         self.markers_pub.publish(array)
+
+    @staticmethod
+    def create_center_marker(header, marker_id, xyz):
+        marker = Marker()
+        marker.header = header
+        marker.ns = "object_centers"
+        marker.id = marker_id
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x, marker.pose.position.y, marker.pose.position.z = xyz
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = marker.scale.y = marker.scale.z = 0.035
+        marker.color.r = 0.1
+        marker.color.g = 1.0
+        marker.color.b = 0.1
+        marker.color.a = 1.0
+        return marker
+
+    @staticmethod
+    def create_label_marker(header, marker_id, xyz, obj):
+        marker = Marker()
+        marker.header = header
+        marker.ns = "object_labels"
+        marker.id = marker_id
+        marker.type = Marker.TEXT_VIEW_FACING
+        marker.action = Marker.ADD
+        marker.pose.position.x, marker.pose.position.y, marker.pose.position.z = xyz
+        marker.pose.position.y -= 0.025
+        marker.pose.orientation.w = 1.0
+        marker.scale.z = 0.022
+        marker.color.r = marker.color.g = marker.color.b = marker.color.a = 1.0
+
+        pixel = obj.get("representative_pixel_uv")
+        depth = obj.get("representative_depth_m")
+        if pixel is not None and depth is not None:
+            marker.text = (
+                f"{obj['class_name']} ({pixel[0]},{pixel[1]}) {depth:.3f}m"
+            )
+        else:
+            marker.text = f"{obj['class_name']} {xyz[2]:.3f}m"
+        return marker
 
     def log_status(self):
         self.get_logger().info(
             f"received color/depth={self.color_count}/{self.depth_count} "
-            f"queued={self.queued_count} published={self.processed_count} "
+            f"queued={self.queued_count} published={self.published_count} "
             f"worker_alive={self.worker.is_alive()}"
         )
 

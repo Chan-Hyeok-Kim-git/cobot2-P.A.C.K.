@@ -175,7 +175,9 @@ ros2 topic echo /ai/objects_3d/json --once
 
 ## YOLO Segmentation 단일 모델 Point Cloud
 
-MobileSAM 없이 segmentation `best.pt`의 instance mask를 aligned depth에 바로 적용한다.
+현재 기본 실행 경로다. MobileSAM 없이 segmentation `best.pt`의 instance mask를
+aligned depth에 바로 적용한다. 세그멘테이션 전용 파라미터는
+`src/object_detector/config/seg_pointcloud.yaml`에서 관리한다.
 
 ```bash
 cd /home/spacewhale0107/cobot_ws/projects/doosan_rokey_bootcamp/collaborative_project_2/code/rokey-cobot2
@@ -188,3 +190,18 @@ ros2 launch object_detector seg_pointcloud_with_camera.launch.py \
 ```
 
 GPU 사용 시 `device:=0`. 출력 topic과 RViz 설정은 기존 Point Cloud launch와 같다.
+
+주요 출력은 다음과 같다.
+
+- `/ai/object_points`: 검출 물체 포인트. 필드 `x`, `y`, `z`, `rgb`, `class_id`.
+- `/ai/background_points`: 검출된 모든 물체를 제거한 배경 포인트.
+- `/ai/objects_3d/json`: 물체별 대표 픽셀, depth, camera-frame XYZ와 품질 정보.
+- `/ai/objects_3d/markers`: RViz2용 중심점과 클래스·거리 표기.
+- `/ai/detections_3d/image`: 세그멘테이션 마스크와 대표점이 표시된 영상.
+
+기본 `background_exclusion_mode:=all`은 검출된 모든 물체를 배경에서 제거한다.
+필요하면 launch 인자로 `class` 또는 `none`을 지정할 수 있다.
+
+상태 로그의 `queued`와 `published`는 현재 큐 크기가 아닌 실행 후 누적 건수다.
+입력과 출력 큐의 실제 최대 크기는 각각 1이며, 처리 지연 시 오래된 결과보다
+최신 결과를 우선한다.

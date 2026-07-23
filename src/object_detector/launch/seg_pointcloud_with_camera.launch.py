@@ -46,7 +46,7 @@ def generate_launch_description():
         name="yolo_pointcloud",
         output="screen",
         parameters=[
-            str(detector_share / "config" / "pointcloud.yaml"),
+            str(detector_share / "config" / "seg_pointcloud.yaml"),
             {
                 "model_path": model_path,
                 "device": ParameterValue(device, value_type=str),
@@ -66,12 +66,35 @@ def generate_launch_description():
         condition=IfCondition(start_rviz),
     )
     return LaunchDescription([
-        DeclareLaunchArgument("model_path"),
-        DeclareLaunchArgument("device", default_value="cpu"),
-        DeclareLaunchArgument("start_camera", default_value="true"),
-        DeclareLaunchArgument("start_rviz", default_value="true"),
-        DeclareLaunchArgument("background_exclusion_mode", default_value="all"),
-        DeclareLaunchArgument("target_class", default_value=""),
+        DeclareLaunchArgument(
+            "model_path",
+            description="Absolute path to a YOLO segmentation model",
+        ),
+        DeclareLaunchArgument(
+            "device",
+            default_value="cpu",
+            description="Ultralytics inference device, for example cpu or 0",
+        ),
+        DeclareLaunchArgument(
+            "start_camera",
+            default_value="true",
+            description="Start the RealSense node in this launch",
+        ),
+        DeclareLaunchArgument(
+            "start_rviz",
+            default_value="true",
+            description="Start RViz2 with the object point-cloud config",
+        ),
+        DeclareLaunchArgument(
+            "background_exclusion_mode",
+            default_value="all",
+            description="Background removal mode: all, class, or none",
+        ),
+        DeclareLaunchArgument(
+            "target_class",
+            default_value="",
+            description="Class removed when background_exclusion_mode is class",
+        ),
         camera,
         pointcloud,
         rviz,
