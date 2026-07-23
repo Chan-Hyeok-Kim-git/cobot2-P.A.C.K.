@@ -1,0 +1,20 @@
+grasp_local_validator:
+  ros__parameters:
+    target_cloud_topic: /grasp_scene/target_cloud
+    environment_cloud_topic: /grasp_scene/environment_cloud
+    candidate_topic: /grasp_scene/grasp_candidates
+    result_topic: /grasp_validation/results
+
+    approach_sample_step: 0.010
+
+    enable_width_check: true
+    enable_contact_check: true
+    enable_environment_collision: true
+    enable_target_collision: true
+    enable_shelf_collision: true
+    enable_ik_check: true
+
+    min_contact_points: 10
+    max_joint_jump_rad: 0.6
+
+    publish_debug_markers: true

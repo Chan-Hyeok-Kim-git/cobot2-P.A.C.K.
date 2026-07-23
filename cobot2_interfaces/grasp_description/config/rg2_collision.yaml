@@ -1,0 +1,48 @@
+model:
+  name: rg2
+  frame_id: rg2_base_link
+  unit: meter
+
+spec:
+  physical_min_opening: 0.000
+  physical_max_opening: 0.110
+  usable_max_opening: 0.105
+
+  total_length: 0.213
+  maximum_width: 0.149
+  body_thickness: 0.036
+  mass: 0.780
+
+safety:
+  width_margin: 0.005
+  collision_margin: 0.004
+  collision_point_threshold: 5
+  collision_voxel_size: 0.005
+  collision_voxel_threshold: 3
+
+collision_geometry:
+  body:
+    center: [0.000, 0.000, 0.066]
+    size: [0.036, 0.075, 0.132]
+
+  linkage_envelope:
+    center: [0.000, 0.000, 0.153]
+    size: [0.036, 0.149, 0.055]
+
+  left_finger:
+    size: [0.024, 0.007, 0.081]
+    center_x: 0.000
+    center_z: 0.1725
+    y_sign: 1.0
+
+  right_finger:
+    size: [0.024, 0.007, 0.081]
+    center_x: 0.000
+    center_z: 0.1725
+    y_sign: -1.0
+  
+  camera_mount:
+    enabled: true
+    center_local: [0.0, 0.060, -0.100]
+    size: [0.030, 0.100, 0.030]
+  

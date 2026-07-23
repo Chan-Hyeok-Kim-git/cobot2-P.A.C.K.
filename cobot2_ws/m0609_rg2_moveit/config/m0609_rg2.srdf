@@ -1,0 +1,102 @@
+<?xml version="1.0" ?>
+<!--This does not replace URDF, and is not an extension of URDF.
+    This is a format for representing semantic information about the robot structure.
+    A URDF file must exist for this robot as well, where the joints and the links that are referenced are defined
+-->
+<robot name="m0609_rg2">
+
+    <!--GROUPS: Representation of a set of joints and links. This can be useful for specifying DOF to plan for, defining arms, end effectors, etc-->
+
+    <!-- [원본] manipulator 그룹: tip_link를 link_6 → tool0으로 수정 (RG2가 tool0에 붙어있으므로) -->
+    <group name="manipulator">
+        <chain base_link="base_link" tip_link="tool0" />
+    </group>
+
+    <!-- [추가] gripper 그룹: RG2 그리퍼의 주 관절 정의 -->
+    <group name="gripper">
+        <joint name="rg2_finger_joint" />
+    </group>
+
+    <!--GROUP STATES: Purpose: Define a named state for a particular group, in terms of joint values.-->
+
+    <!-- [원본] manipulator 초기 자세 -->
+    <group_state name="all-zeros" group="manipulator">
+        <joint name="joint_1" value="0" />
+        <joint name="joint_2" value="0" />
+        <joint name="joint_3" value="0" />
+        <joint name="joint_4" value="0" />
+        <joint name="joint_5" value="0" />
+        <joint name="joint_6" value="0" />
+    </group_state>
+
+    <!-- [추가] gripper 열림 상태 -->
+    <group_state name="gripper_open" group="gripper">
+    <joint name="rg2_finger_joint" value="-0.558505" />
+	</group_state>
+
+	<!-- gripper_close: finger_joint가 양수일 때 닫힘 -->
+	<group_state name="gripper_close" group="gripper">
+		<joint name="rg2_finger_joint" value="0.785398" />
+	</group_state>
+
+    <!--VIRTUAL JOINT: Purpose: this element defines a virtual joint between a robot link and an external frame of reference-->
+
+    <!-- [원본] 베이스 고정 조인트 -->
+    <virtual_joint name="FixedBase" type="fixed" parent_frame="world" child_link="base_link" />
+
+    <!--END EFFECTOR: Purpose: Represent information about an end effector-->
+
+    <!-- [추가] RG2를 manipulator의 엔드이펙터로 정의 -->
+    <end_effector name="rg2_gripper" parent_link="tool0" group="gripper" />
+
+    <!--DISABLE COLLISIONS: By default it is assumed that any link of the robot could potentially come into collision with any other link in the robot.-->
+
+    <!-- [원본] M0609 팔 링크 간 충돌 비활성화 -->
+    <disable_collisions link1="base_link" link2="link_1" reason="Adjacent"/>
+    <disable_collisions link1="link_1" link2="link_2" reason="Adjacent"/>
+    <disable_collisions link1="link_1" link2="link_3" reason="Never"/>
+    <disable_collisions link1="link_2" link2="link_3" reason="Adjacent"/>
+    <disable_collisions link1="link_2" link2="link_5" reason="Never"/>
+    <disable_collisions link1="link_2" link2="link_6" reason="Never"/>
+    <disable_collisions link1="link_3" link2="link_4" reason="Adjacent"/>
+    <disable_collisions link1="link_3" link2="link_5" reason="Never"/>
+    <disable_collisions link1="link_3" link2="link_6" reason="Never"/>
+    <disable_collisions link1="link_4" link2="link_5" reason="Adjacent"/>
+    <disable_collisions link1="link_4" link2="link_6" reason="Never"/>
+    <disable_collisions link1="link_5" link2="link_6" reason="Adjacent"/>
+
+    <!-- [추가] link_6, tool0과 RG2 베이스 간 충돌 비활성화 (인접 링크) -->
+    <disable_collisions link1="link_6" link2="rg2_base_link" reason="Never"/>
+    <disable_collisions link1="tool0" link2="rg2_base_link" reason="Adjacent"/>
+
+    <!-- [추가] RG2 그리퍼 내부 링크 간 충돌 비활성화 -->
+    <disable_collisions link1="rg2_base_link" link2="rg2_left_outer_knuckle" reason="Adjacent"/>
+    <disable_collisions link1="rg2_base_link" link2="rg2_left_inner_knuckle" reason="Adjacent"/>
+    <disable_collisions link1="rg2_base_link" link2="rg2_right_outer_knuckle" reason="Adjacent"/>
+    <disable_collisions link1="rg2_base_link" link2="rg2_right_inner_knuckle" reason="Adjacent"/>
+    <disable_collisions link1="rg2_left_outer_knuckle" link2="rg2_left_inner_finger" reason="Adjacent"/>
+    <disable_collisions link1="rg2_left_outer_knuckle" link2="rg2_left_inner_knuckle" reason="Never"/>
+    <disable_collisions link1="rg2_right_outer_knuckle" link2="rg2_right_inner_finger" reason="Adjacent"/>
+    <disable_collisions link1="rg2_right_outer_knuckle" link2="rg2_right_inner_knuckle" reason="Never"/>
+    
+    <disable_collisions link1="rg2_right_inner_knuckle" link2="rg2_right_inner_finger" reason="Adjacent"/>
+    <disable_collisions link1="rg2_left_inner_knuckle" link2="rg2_left_inner_finger" reason="Adjacent"/>
+    <!-- [추가] RG2 양쪽 finger 간 충돌 비활성화 (닫힘 상태에서 접촉) -->
+    <disable_collisions link1="rg2_left_inner_finger" link2="rg2_right_inner_finger" reason="Adjacent"/>
+    <disable_collisions link1="rg2_left_outer_knuckle" link2="rg2_right_outer_knuckle" reason="Never"/>
+    <disable_collisions link1="rg2_left_inner_knuckle" link2="rg2_right_inner_knuckle" reason="Never"/>
+    <disable_collisions link1="rg2_left_inner_finger" link2="rg2_right_outer_knuckle" reason="Never"/>
+    <disable_collisions link1="rg2_right_inner_finger" link2="rg2_left_outer_knuckle" reason="Never"/>
+
+    <!-- [추가] RG2 그리퍼와 로봇 팔 끝단 링크 간 충돌 비활성화 -->
+    <disable_collisions link1="link_5" link2="rg2_base_link" reason="Never"/>
+    <disable_collisions link1="link_6" link2="rg2_left_outer_knuckle" reason="Never"/>
+    <disable_collisions link1="link_6" link2="rg2_right_outer_knuckle" reason="Never"/>
+    <disable_collisions link1="link_6" link2="rg2_left_inner_knuckle" reason="Never"/>
+    <disable_collisions link1="link_6" link2="rg2_right_inner_knuckle" reason="Never"/>
+    <passive_joint name="rg2_right_outer_knuckle_joint"/>
+    <passive_joint name="rg2_left_inner_knuckle_joint"/>
+    <passive_joint name="rg2_right_inner_knuckle_joint"/>
+    <passive_joint name="rg2_left_inner_finger_joint"/>
+    <passive_joint name="rg2_right_inner_finger_joint"/>
+</robot>

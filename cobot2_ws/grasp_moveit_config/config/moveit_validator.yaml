@@ -1,0 +1,20 @@
+moveit_validator:
+  ros__parameters:
+    planning_group: manipulator
+    base_frame: base_link
+    end_effector_link: rg2_tcp
+
+    planner_id: RRTConnectkConfigDefault
+
+    planning_time: 2.0
+    planning_attempts: 3
+
+    velocity_scaling: 0.20
+    acceleration_scaling: 0.20
+
+    cartesian_eef_step: 0.005
+    cartesian_jump_threshold: 0.0
+    cartesian_fraction_threshold: 0.99
+
+    joint_state_timeout: 0.5
+    dynamic_obstacle_margin: 0.005
