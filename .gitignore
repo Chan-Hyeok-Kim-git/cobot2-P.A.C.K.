@@ -223,6 +223,16 @@ build/
 install/
 log/
 
+# Local datasets and trained model weights
+dataset/
+*.pt
+
+# ROS graph exports and local archives
+frames_*.gv
+frames_*.pdf
+*.zip
+*.ZIP
+
 # Python
 __pycache__/
 *.py[cod]
