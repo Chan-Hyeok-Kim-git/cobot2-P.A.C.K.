@@ -1,355 +1,624 @@
+#!/usr/bin/env python3
 """
-cobot2_move.py — 실제 로봇 실행 모듈
+cobot2_move.py — 두산 M0609 + OnRobot RG2 실제 실행 노드
 
 역할:
-  /motion_plan (JSON) 을 구독해서 실제 로봇을 움직임.
+  /motion_plan(JSON)을 순서대로 받아 실제 로봇과 RG2를 제어한다.
 
-  실행 순서:
-    1. 그리퍼 열기 (OnRobot /onrobot/sendCommand)
-    2. DSR movej → pre-grasp 위치
-    3. DSR movel → grasp 위치 (직선 접근)
-    4. 그리퍼 닫기 (물체 폭만큼)
-    5. 파지 확인 (그리퍼가 완전히 닫히지 않았는지)
-    6. DSR movel → 들어올리기 (+z 10cm)
-    7. DSR movej → 수납함 위치 (고정 관절 각도)
-    8. 그리퍼 열기 (놓기)
-    9. DSR movej → 홈 복귀
+그리퍼 제어:
+  기존 /onrobot/sendCommand ROS 서비스 대신 같은 패키지의 onrobot.py를
+  직접 import하여 Compute Box의 Modbus TCP 레지스터를 제어한다.
 
-  물품 큐(Queue):
-    /object_info 를 직접 구독해서 순서대로 처리.
-    처리 중엔 새 물품은 큐에만 저장, 완료되면 다음 물품 처리.
+/motion_plan에서 사용하는 주요 필드:
+  class_name            string
+  grasp_type            string
+  pre_grasp_xyz         [x, y, z]            단위 m
+  grasp_xyz             [x, y, z]            단위 m
+  pre_grasp_joints      [j1 ... j6]          단위 deg, 선택
+  grasp_joints          [j1 ... j6]          단위 deg, 선택
+  pre_grasp_abc_deg     [a, b, c]            단위 deg, 선택
+  grasp_abc_deg         [a, b, c]            단위 deg, 선택
+  grip_width_mm         물체의 예상 파지 폭, 단위 mm
+  trajectory            MoveIt trajectory, 선택
 
-ROS 인터페이스:
-  SUB  /motion_plan      (std_msgs/String, JSON)
-  SUB  /grasp_result     (std_msgs/String, JSON)  ← 못 잡음 알림
-  PUB  /execution_result (std_msgs/String, JSON)
-  CALL /onrobot/sendCommand (onrobot_rg_msgs/srv/SetCommand)
+실행 순서:
+  1. 물체 폭보다 여유 있게 RG2 열기
+  2. pre-grasp 이동
+  3. grasp 이동
+  4. 물체 폭보다 조금 좁은 목표 폭으로 RG2 닫기
+  5. RG2 grip detected 상태 확인
+  6. 들어올리기
+  7. 수납함 이동
+  8. RG2 완전 열기
+  9. 홈 복귀
 """
 
 import json
+import math
 import queue
 import threading
 import time
-import rclpy
+from typing import Any, Dict, Optional, Sequence
+
 import DR_init
-from rclpy.node import Node
+import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.node import Node
 from std_msgs.msg import String
 
+# onrobot.py가 cobot2_move.py와 같은 Python 패키지에 있을 때와,
+# 두 파일을 직접 실행 경로에 놓았을 때를 모두 지원한다.
+RG_IMPORT_ERROR: Optional[Exception] = None
 try:
-    from onrobot_rg_msgs.srv import SetCommand
-    HAS_ONROBOT = True
-except ImportError:
-    HAS_ONROBOT = False
+    from .onrobot import RG
+except (ImportError, ValueError):
+    try:
+        from onrobot import RG
+    except ImportError as exc:
+        RG = None  # type: ignore[assignment,misc]
+        RG_IMPORT_ERROR = exc
 
-# ── DSR 전역 (main에서 import 후 바인딩) ──────────────────────────────
-_DSR = {}
 
-# ── 상수 ──────────────────────────────────────────────────────────────
-ROBOT_ID    = 'dsr01'
-ROBOT_MODEL = 'm0609'   # ★ 추가: DR_init 등록에 필요 (누락되어 있었음)
-VELOCITY   = 30      # mm/s (movel)
-ACC        = 30
-JOINT_VEL  = 30      # deg/s (movej)
-JOINT_ACC  = 30
+# main()에서 DSR_ROBOT2 함수를 import한 뒤 여기에 바인딩한다.
+_DSR: Dict[str, Any] = {}
 
-LIFT_HEIGHT_MM  = 100.0   # 파지 후 들어올리기 높이 (mm)
-GRIPPER_TIMEOUT = 5.0     # 그리퍼 서비스 응답 대기 (초)
+# ── 로봇 설정 ────────────────────────────────────────────────────────
+ROBOT_ID = 'dsr01'
+ROBOT_MODEL = 'm0609'
 
-# 수납함 위치 (관절 각도, deg) — 실기에서 측정 후 수정
-BIN_JOINT_DEG  = [0.0, -30.0, 120.0, 0.0, 90.0, 0.0]
-# 홈 위치 (관절 각도, deg)
-HOME_JOINT_DEG = [0.0,   0.0,   0.0, 0.0,  0.0, 0.0]
+VELOCITY = 30       # mm/s, Cartesian motion
+ACC = 30            # mm/s^2
+JOINT_VEL = 30      # deg/s
+JOINT_ACC = 30      # deg/s^2
+
+LIFT_HEIGHT_MM = 100.0
+
+# 실기에서 측정 후 수정
+BIN_JOINT_DEG = [0.0, -30.0, 120.0, 0.0, 90.0, 0.0]
+HOME_JOINT_DEG = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 
 class RobotExecutor(Node):
-    def __init__(self):
-        # ★ 수정: namespace=ROBOT_ID 추가.
-        # DSR_ROBOT2.py는 서비스 클라이언트를 상대 경로(예: motion/move_joint)로
-        # 생성하는데, 이는 노드 자신의 네임스페이스를 기준으로 해석된다.
-        # namespace가 없으면 /motion/move_joint로 해석되어 실제 서비스
-        # (/dsr01/motion/move_joint)를 영원히 못 찾고 "Service is not
-        # available" 대기 상태에 머무른다.
-        # cobot2_grasp.py의 grasp_validator는 이미 namespace=ROBOT_ID로
-        # 생성되어 있었기 때문에 정상 동작했던 것이다.
+    def __init__(self) -> None:
+        # DSR_ROBOT2가 상대 서비스 이름을 /dsr01 아래에서 찾도록 namespace 지정
         super().__init__('cobot2_move', namespace=ROBOT_ID)
         self._cb_group = ReentrantCallbackGroup()
 
-        # 물품 처리 큐
-        self._queue   = queue.Queue()
-        self._busy    = False
-        self._lock    = threading.Lock()
+        self._queue: queue.Queue[dict] = queue.Queue()
+        self._busy = False
+        self._state_lock = threading.Lock()
+        self._gripper_lock = threading.Lock()
+        self._rg2 = None
 
-        # 구독 / 퍼블리시
+        # ── ROS 파라미터 ────────────────────────────────────────────
+        # onrobot_ip는 반드시 실제 Compute Box IP로 맞춘다.
+        self.declare_parameter('onrobot_ip', '192.168.1.1')
+        self.declare_parameter('onrobot_port', 502)
+        self.declare_parameter('onrobot_gripper', 'rg2')
+
+        # onrobot.py의 force 단위는 1/10 N. 300 = 30.0 N
+        self.declare_parameter('gripper_force_raw', 300)
+        self.declare_parameter('gripper_timeout_sec', 5.0)
+        self.declare_parameter('gripper_poll_period_sec', 0.1)
+
+        # 물체 폭에 따라 열고 닫을 때 사용하는 보정값
+        self.declare_parameter('gripper_open_margin_mm', 15.0)
+        self.declare_parameter('gripper_min_open_clearance_mm', 3.0)
+        self.declare_parameter('gripper_close_offset_mm', 4.0)
+        self.declare_parameter('require_grip_detected', True)
+
+        self._onrobot_ip = str(
+            self.get_parameter('onrobot_ip').get_parameter_value().string_value
+        )
+        self._onrobot_port = int(
+            self.get_parameter('onrobot_port').get_parameter_value().integer_value
+        )
+        self._onrobot_gripper = str(
+            self.get_parameter('onrobot_gripper').get_parameter_value().string_value
+        ).lower()
+        self._gripper_force_raw = int(
+            self.get_parameter('gripper_force_raw').get_parameter_value().integer_value
+        )
+        self._gripper_timeout_sec = float(
+            self.get_parameter('gripper_timeout_sec').get_parameter_value().double_value
+        )
+        self._gripper_poll_period_sec = float(
+            self.get_parameter('gripper_poll_period_sec').get_parameter_value().double_value
+        )
+        self._gripper_open_margin_mm = float(
+            self.get_parameter('gripper_open_margin_mm').get_parameter_value().double_value
+        )
+        self._gripper_min_open_clearance_mm = float(
+            self.get_parameter('gripper_min_open_clearance_mm')
+            .get_parameter_value()
+            .double_value
+        )
+        self._gripper_close_offset_mm = float(
+            self.get_parameter('gripper_close_offset_mm').get_parameter_value().double_value
+        )
+        self._require_grip_detected = bool(
+            self.get_parameter('require_grip_detected').get_parameter_value().bool_value
+        )
+
+        # ── ROS 인터페이스 ──────────────────────────────────────────
         self.create_subscription(
-            String, '/motion_plan', self._on_motion_plan, 10,
-            callback_group=self._cb_group)
+            String,
+            '/motion_plan',
+            self._on_motion_plan,
+            10,
+            callback_group=self._cb_group,
+        )
         self.create_subscription(
-            String, '/grasp_result', self._on_grasp_result, 10,
-            callback_group=self._cb_group)
+            String,
+            '/grasp_result',
+            self._on_grasp_result,
+            10,
+            callback_group=self._cb_group,
+        )
         self.pub = self.create_publisher(String, '/execution_result', 10)
 
-        # OnRobot 그리퍼 서비스 클라이언트
-        if HAS_ONROBOT:
-            self._gripper_cli = self.create_client(
-                SetCommand, '/onrobot/sendCommand',
-                callback_group=self._cb_group)
-        else:
-            self._gripper_cli = None
-            self.get_logger().warn('onrobot_rg_msgs 없음 — 그리퍼 제어 스킵')
+        self._connect_gripper()
 
-        # 큐 처리 워커 스레드
-        threading.Thread(target=self._worker, daemon=True).start()
+        self._worker_thread = threading.Thread(
+            target=self._worker,
+            name='cobot2_move_worker',
+            daemon=True,
+        )
+        self._worker_thread.start()
 
         self.get_logger().info('RobotExecutor 준비 완료')
 
     # ── 입력 처리 ────────────────────────────────────────────────────
-    def _on_motion_plan(self, msg: String):
+    def _on_motion_plan(self, msg: String) -> None:
         try:
             plan = json.loads(msg.data)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            self.get_logger().error(f'/motion_plan JSON 오류: {exc}')
             return
+
+        if not isinstance(plan, dict):
+            self.get_logger().error('/motion_plan은 JSON object여야 함')
+            return
+
         self._queue.put(plan)
         self.get_logger().info(
-            f"[{plan.get('class_name')}] 큐 추가 (현재 큐 크기={self._queue.qsize()})")
+            f"[{plan.get('class_name', '?')}] 큐 추가 "
+            f"(현재 큐 크기={self._queue.qsize()})"
+        )
 
-    def _on_grasp_result(self, msg: String):
+    def _on_grasp_result(self, msg: String) -> None:
         try:
-            res = json.loads(msg.data)
-        except json.JSONDecodeError:
+            result = json.loads(msg.data)
+        except json.JSONDecodeError as exc:
+            self.get_logger().error(f'/grasp_result JSON 오류: {exc}')
             return
-        if not res.get('success', True):
-            self.get_logger().warn(
-                f"[{res.get('class_name')}] 파지 불가 — 큐에서 제외: {res.get('reason')}")
-            self._publish_result(res.get('class_name', '?'), False, res.get('reason', ''))
 
-    # ── 큐 워커 ─────────────────────────────────────────────────────
-    def _worker(self):
-        """순차 처리: 큐에서 꺼내 하나씩 실행"""
+        if isinstance(result, dict) and not result.get('success', True):
+            name = result.get('class_name', '?')
+            reason = result.get('reason', '파지 후보 없음')
+            self.get_logger().warning(f'[{name}] 파지 불가: {reason}')
+            self._publish_result(name, False, reason)
+
+    # ── 큐 처리 ──────────────────────────────────────────────────────
+    def _worker(self) -> None:
         while rclpy.ok():
             try:
                 plan = self._queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
-            with self._lock:
+            with self._state_lock:
                 self._busy = True
+
             try:
                 self._execute(plan)
-            except Exception as e:
-                self.get_logger().error(f"실행 오류: {e}")
-                self._publish_result(plan.get('class_name', '?'), False, str(e))
+            except Exception as exc:  # 작업 하나의 실패가 노드 전체를 종료시키지 않게 함
+                name = plan.get('class_name', '?') if isinstance(plan, dict) else '?'
+                self.get_logger().error(f'[{name}] 실행 오류: {exc}')
+                self._publish_result(name, False, str(exc))
             finally:
-                with self._lock:
+                with self._state_lock:
                     self._busy = False
                 self._queue.task_done()
 
     # ── 실제 실행 ────────────────────────────────────────────────────
-    def _execute(self, plan: dict):
-        name        = plan.get('class_name', '?')
-        pre_xyz     = plan.get('pre_grasp_xyz', [0, 0, 0.5])
-        grasp_xyz   = plan.get('grasp_xyz',     [0, 0, 0.3])
-        grasp_type  = plan.get('grasp_type', 'FRONT')
-        # ★ 수정: cobot2_mi.py가 전달하는 grasp_joints/pre_grasp_joints 사용
-        # DSR ikin + MoveIt으로 이미 검증된 관절값 → movej에 직접 사용 가능
-        grasp_joints     = plan.get('grasp_joints', None)      # float64[6] or None
-        pre_grasp_joints = plan.get('pre_grasp_joints', None)  # float64[6] or None
-        # ★ 수정: grip_width_mm이 전혀 전달되지 않아 미정의 변수 크래시가 났던 부분.
-        # cobot2_mi_node가 이제 required_width(m)를 mm로 변환해서 보내준다.
-        grip_w_mm = plan.get('grip_width_mm', 50.0)
+    def _execute(self, plan: dict) -> None:
+        if not _DSR:
+            raise RuntimeError('DSR 함수가 바인딩되지 않음')
 
-        dsr = _DSR
-        if not dsr:
-            self.get_logger().error('DSR 함수가 바인딩되지 않음')
-            return
+        name = str(plan.get('class_name', '?'))
+        grasp_type = str(plan.get('grasp_type', 'FRONT'))
 
-        movel  = dsr['movel']
-        movej  = dsr['movej']
-        movejx = dsr['movejx']
-        posx   = dsr['posx']
-        posj   = dsr['posj']
-        wait   = dsr['wait']
+        pre_xyz = self._vector3(plan.get('pre_grasp_xyz'), [0.0, 0.0, 0.5])
+        grasp_xyz = self._vector3(plan.get('grasp_xyz'), [0.0, 0.0, 0.3])
 
-        self.get_logger().info(f'[{name}] {grasp_type} 파지 시작')
+        grasp_abc = self._vector3(plan.get('grasp_abc_deg'), [0.0, 0.0, 0.0])
+        pre_grasp_abc = self._vector3(
+            plan.get('pre_grasp_abc_deg'),
+            grasp_abc,
+        )
 
-        # ── 1. 그리퍼 열기 ────────────────────────────────────────
-        self._gripper_cmd('o')
-        wait(0.5)
+        grasp_joints = self._joint_vector(plan.get('grasp_joints'))
+        pre_grasp_joints = self._joint_vector(plan.get('pre_grasp_joints'))
 
-        # ── 2. pre-grasp 이동 ───────────────────────────────────
-        # ★ 수정: movej()는 관절각도(posj)만 받는데 이전 코드는
-        # Cartesian 좌표(posx)를 그대로 넘겨서 'Invalid type : pos' 에러로
-        # 크래시가 났었다. 이제 pre_grasp_joints(DSR ikin으로 이미 검증된
-        # 관절값)가 있으면 movej(posj(...))로 바로 이동하고, 없을 때만
-        # movejx(Cartesian 목표를 내부적으로 IK 풀어서 관절이동)로 대체한다.
-        if pre_grasp_joints and len(pre_grasp_joints) == 6:
-            pre_posj = posj(*pre_grasp_joints)
-            movej(pre_posj, vel=JOINT_VEL, acc=JOINT_ACC)
+        object_width_mm = self._positive_float(
+            plan.get('grip_width_mm', 50.0),
+            field_name='grip_width_mm',
+        )
+
+        pre_open_width_mm, grip_target_width_mm = self._calculate_gripper_widths(
+            object_width_mm
+        )
+
+        movel = _DSR['movel']
+        movej = _DSR['movej']
+        movejx = _DSR['movejx']
+        posx = _DSR['posx']
+        posj = _DSR['posj']
+        wait = _DSR['wait']
+
+        self.get_logger().info(
+            f'[{name}] {grasp_type} 파지 시작: '
+            f'물체 폭={object_width_mm:.1f} mm, '
+            f'접근 개방폭={pre_open_width_mm:.1f} mm, '
+            f'파지 목표폭={grip_target_width_mm:.1f} mm'
+        )
+
+        # 1. 물체 폭보다 넓게 개방
+        self._move_gripper_mm(pre_open_width_mm)
+        wait(0.2)
+
+        # 2. pre-grasp 이동
+        if pre_grasp_joints is not None:
+            movej(
+                posj(*pre_grasp_joints),
+                vel=JOINT_VEL,
+                acc=JOINT_ACC,
+            )
         else:
             pre_posx = posx(
-                pre_xyz[0]*1000, pre_xyz[1]*1000, pre_xyz[2]*1000,
-                0, 0, 0
+                pre_xyz[0] * 1000.0,
+                pre_xyz[1] * 1000.0,
+                pre_xyz[2] * 1000.0,
+                pre_grasp_abc[0],
+                pre_grasp_abc[1],
+                pre_grasp_abc[2],
             )
             movejx(pre_posx, vel=JOINT_VEL, acc=JOINT_ACC)
 
-        # ── 3. grasp 위치로 이동 ─────────────────────────────────
-        # ★ 수정: 이전에는 trajectory(웨이포인트 목록)가 있으면 무조건
-        # 그걸 우선 실행했는데, _exec_trajectory가 매 웨이포인트마다
-        # 별도의 movej()를 호출하는 구조라서 "가다 서다"를 수십~백여 번
-        # 반복하는 끊긴 움직임이 됐다(Cartesian 경로는 보통 100개 이상의
-        # 점으로 구성됨). 로봇이 "짧은 거리를 계속 계산"하는 것처럼
-        # 보였던 원인이 바로 이것이다.
-        #
-        # grasp_joints는 이미 DSR ikin으로 검증됐고, MoveIt의 plan()
-        # 성공 여부로 "충돌 없는 경로가 존재한다"는 것도 확인됐다.
-        # 굳이 중간 웨이포인트를 하나하나 재생할 필요 없이, 검증된
-        # 최종 목표로 movej 한 번에 이동하면 로봇 자체 컨트롤러가
-        # 가속-정속-감속을 매끄럽게 처리해서 훨씬 자연스럽게 움직인다.
-        # trajectory는 grasp_joints가 없는 예외 상황에서만 폴백으로 사용.
-        traj = plan.get('trajectory')
-        if grasp_joints and len(grasp_joints) == 6:
-            j = posj(*grasp_joints)
-            movej(j, vel=JOINT_VEL, acc=JOINT_ACC)
-        elif traj:
-            self._exec_trajectory(traj)
+        # 3. grasp 이동
+        trajectory = plan.get('trajectory')
+        if isinstance(trajectory, dict) and trajectory.get('points'):
+            self._exec_trajectory(trajectory)
+        elif grasp_joints is not None:
+            movej(
+                posj(*grasp_joints),
+                vel=JOINT_VEL,
+                acc=JOINT_ACC,
+            )
         else:
             grasp_posx = posx(
-                grasp_xyz[0]*1000, grasp_xyz[1]*1000, grasp_xyz[2]*1000,
-                0, 0, 0
+                grasp_xyz[0] * 1000.0,
+                grasp_xyz[1] * 1000.0,
+                grasp_xyz[2] * 1000.0,
+                grasp_abc[0],
+                grasp_abc[1],
+                grasp_abc[2],
             )
-            movejx(grasp_posx, vel=VELOCITY, acc=ACC)
+            movejx(grasp_posx, vel=JOINT_VEL, acc=JOINT_ACC)
 
         wait(0.3)
 
-        # ── 4. 그리퍼 닫기 ────────────────────────────────────────
-        grip_cmd = str(int(grip_w_mm * 10))  # mm → 1/10mm 단위 정수 문자열
-        self._gripper_cmd(grip_cmd)
-        wait(1.0)
+        # 4. 물체 폭보다 조금 좁게 닫아서 접촉력 생성
+        self._move_gripper_mm(grip_target_width_mm)
+        wait(0.2)
 
-        # ── 5. 파지 확인 (그리퍼 폭이 0mm면 슬립, 너무 넓으면 실패) ─
-        # (실기에서 /onrobot/pose 서비스로 현재 폭 확인 가능)
+        # 5. 파지 확인
+        grip_detected, actual_width_mm = self._read_grip_state()
+        self.get_logger().info(
+            f'[{name}] RG2 상태: grip_detected={grip_detected}, '
+            f'현재 폭={actual_width_mm:.1f} mm'
+        )
 
-        # ── 6. 들어올리기 ─────────────────────────────────────────
+        if self._require_grip_detected and not grip_detected:
+            raise RuntimeError(
+                f'RG2 파지 감지 실패 '
+                f'(명령 폭={grip_target_width_mm:.1f} mm, '
+                f'현재 폭={actual_width_mm:.1f} mm)'
+            )
+
+        # 6. 파지 자세를 유지한 채 +Z 방향으로 들어올림
         lift_posx = posx(
-            grasp_xyz[0]*1000,
-            grasp_xyz[1]*1000,
-            (grasp_xyz[2] + LIFT_HEIGHT_MM/1000)*1000,
-            0, 0, 0
+            grasp_xyz[0] * 1000.0,
+            grasp_xyz[1] * 1000.0,
+            grasp_xyz[2] * 1000.0 + LIFT_HEIGHT_MM,
+            grasp_abc[0],
+            grasp_abc[1],
+            grasp_abc[2],
         )
         movel(lift_posx, vel=VELOCITY, acc=ACC)
 
-        # ── 7. 수납함 이동 ────────────────────────────────────────
-        bin_posj = posj(*BIN_JOINT_DEG)
-        movej(bin_posj, vel=JOINT_VEL, acc=JOINT_ACC)
+        # 7. 수납함 이동
+        movej(
+            posj(*BIN_JOINT_DEG),
+            vel=JOINT_VEL,
+            acc=JOINT_ACC,
+        )
         wait(0.5)
 
-        # ── 8. 그리퍼 열기 (놓기) ────────────────────────────────
-        self._gripper_cmd('o')
-        wait(0.5)
+        # 8. 물체 놓기 — 완전 개방
+        self._open_gripper_fully()
+        wait(0.3)
 
-        # ── 9. 홈 복귀 ───────────────────────────────────────────
-        home_posj = posj(*HOME_JOINT_DEG)
-        movej(home_posj, vel=JOINT_VEL, acc=JOINT_ACC)
+        # 9. 홈 복귀
+        movej(
+            posj(*HOME_JOINT_DEG),
+            vel=JOINT_VEL,
+            acc=JOINT_ACC,
+        )
 
         self.get_logger().info(f'[{name}] 파지-수납 완료')
         self._publish_result(name, True, '파지-수납 완료')
 
-    def _exec_trajectory(self, traj_dict: dict):
-        """
-        MoveIt이 계획한 joint trajectory를 DSR로 실행 (폴백 경로).
+    def _exec_trajectory(self, trajectory: dict) -> None:
+        """MoveIt joint trajectory의 각 점을 DSR movej로 실행한다."""
+        if not _DSR:
+            raise RuntimeError('DSR 함수가 바인딩되지 않음')
 
-        ★ 수정: 이전에는 모든 웨이포인트마다 별도 movej()를 호출해서
-        (Cartesian 경로는 보통 100개 이상 점) "가다 서다"가 반복되는
-        끊긴 움직임이 됐었다. 이제 movesj(스플라인 관절이동)가 있으면
-        전체 웨이포인트를 한 번에 넘겨 하나의 매끄러운 연속 동작으로
-        실행하고, movesj를 못 쓰는 환경이면 중간 점은 건너뛰고
-        마지막 목표점으로 movej 한 번만 실행한다.
-        """
-        if not _DSR or not traj_dict:
-            return
-
-        points = traj_dict.get('points', [])
-        if not points:
-            return
-
-        import math
+        movej = _DSR['movej']
         posj = _DSR['posj']
 
-        # 라디안 → 도(degree) 리스트로 일괄 변환
-        posj_list = [
-            posj(*[math.degrees(p) for p in pt['positions'][:6]])
-            for pt in points
-        ]
+        points = trajectory.get('points', [])
+        if not isinstance(points, list) or not points:
+            raise ValueError('trajectory.points가 비어 있음')
 
-        movesj = _DSR.get('movesj')
-        if movesj is not None and len(posj_list) > 1:
-            # 전체 웨이포인트를 하나의 스플라인 동작으로 한 번에 실행
-            # (중간에 멈추지 않고 부드럽게 이어서 움직임)
-            movesj(posj_list, vel=JOINT_VEL, acc=JOINT_ACC)
-        else:
-            # movesj를 쓸 수 없으면 중간 점은 건너뛰고 최종 목표로만 이동
-            movej = _DSR['movej']
-            movej(posj_list[-1], vel=JOINT_VEL, acc=JOINT_ACC)
+        previous_time = 0.0
+        for point in points:
+            positions = point.get('positions', [])
+            if not isinstance(positions, list) or len(positions) < 6:
+                raise ValueError('trajectory point의 positions가 6축이 아님')
 
-    # ── 그리퍼 제어 ──────────────────────────────────────────────────
-    def _gripper_cmd(self, command: str):
-        """
-        command:
-          'o'    → 완전히 열기
-          'c'    → 완전히 닫기
-          '500'  → 50.0mm 폭 (1/10mm 단위 문자열)
-        """
-        if self._gripper_cli is None:
-            self.get_logger().warn(f'그리퍼 명령 스킵: {command}')
+            positions_deg = [math.degrees(float(value)) for value in positions[:6]]
+            target = posj(*positions_deg)
+
+            current_time = float(point.get('time_from_start', previous_time + 0.1))
+            segment_time = max(current_time - previous_time, 0.1)
+            previous_time = current_time
+
+            velocity = max(5, min(60, int(60.0 / segment_time)))
+            movej(target, vel=velocity, acc=velocity)
+
+    # ── OnRobot RG2 직접 Modbus 제어 ─────────────────────────────────
+    def _connect_gripper(self) -> None:
+        if RG is None:
+            self.get_logger().error(
+                f'onrobot.py import 실패: {RG_IMPORT_ERROR}. '
+                'onrobot.py를 cobot2_move.py와 같은 Python 패키지에 넣고 '
+                'pymodbus 호환 버전을 설치해야 함.'
+            )
             return
 
-        if not self._gripper_cli.wait_for_service(timeout_sec=GRIPPER_TIMEOUT):
-            self.get_logger().error('/onrobot/sendCommand 서비스 없음')
-            return
+        try:
+            self._rg2 = RG(
+                gripper=self._onrobot_gripper,
+                ip=self._onrobot_ip,
+                port=self._onrobot_port,
+            )
 
-        req = SetCommand.Request()
-        req.command = command
-        future = self._gripper_cli.call_async(req)
+            # 연결 직후 실제 레지스터를 한 번 읽어 통신 가능 여부 확인
+            flags = self._read_status_flags()
+            self.get_logger().info(
+                f'OnRobot {self._onrobot_gripper.upper()} Modbus 연결 완료: '
+                f'{self._onrobot_ip}:{self._onrobot_port}, status={flags}'
+            )
+        except Exception as exc:
+            self._rg2 = None
+            self.get_logger().error(
+                f'OnRobot Modbus 연결 실패 '
+                f'({self._onrobot_ip}:{self._onrobot_port}): {exc}'
+            )
 
-        start = time.monotonic()
-        while not future.done():
-            if time.monotonic() - start > GRIPPER_TIMEOUT:
-                self.get_logger().error(f'그리퍼 명령 타임아웃: {command}')
+    def _ensure_gripper(self) -> None:
+        if self._rg2 is None:
+            raise RuntimeError(
+                'RG2가 연결되지 않음. onrobot_ip, onrobot_port와 '
+                'Compute Box Modbus TCP 설정을 확인해야 함.'
+            )
+
+    def _calculate_gripper_widths(self, object_width_mm: float) -> tuple[float, float]:
+        self._ensure_gripper()
+
+        max_width_mm = float(self._rg2.max_width) / 10.0
+        if object_width_mm >= max_width_mm:
+            raise ValueError(
+                f'물체 폭 {object_width_mm:.1f} mm가 '
+                f'{self._onrobot_gripper.upper()} 최대 폭 '
+                f'{max_width_mm:.1f} mm 이상임'
+            )
+
+        pre_open_width_mm = min(
+            max_width_mm,
+            object_width_mm + self._gripper_open_margin_mm,
+        )
+        actual_clearance_mm = pre_open_width_mm - object_width_mm
+        if actual_clearance_mm < self._gripper_min_open_clearance_mm:
+            raise ValueError(
+                f'접근 개방 여유가 부족함: {actual_clearance_mm:.1f} mm '
+                f'(필요 최소 {self._gripper_min_open_clearance_mm:.1f} mm)'
+            )
+
+        grip_target_width_mm = max(
+            0.0,
+            object_width_mm - self._gripper_close_offset_mm,
+        )
+        return pre_open_width_mm, grip_target_width_mm
+
+    def _move_gripper_mm(self, width_mm: float) -> None:
+        """RG2를 지정 폭으로 이동한다. width_mm 단위는 mm이다."""
+        self._ensure_gripper()
+
+        max_width_raw = int(self._rg2.max_width)
+        max_force_raw = int(self._rg2.max_force)
+
+        width_raw = int(round(float(width_mm) * 10.0))
+        width_raw = max(0, min(width_raw, max_width_raw))
+        force_raw = max(0, min(self._gripper_force_raw, max_force_raw))
+
+        with self._gripper_lock:
+            # busy 상태에서 새 명령을 보내지 않도록 먼저 대기
+            self._wait_gripper_idle()
+            self._rg2.move_gripper(
+                width_val=width_raw,
+                force_val=force_raw,
+            )
+            # write 응답 직후 busy bit가 갱신될 시간을 조금 준다.
+            time.sleep(0.05)
+            self._wait_gripper_idle()
+
+        self.get_logger().info(
+            f'RG2 이동 완료: 목표 폭={width_raw / 10.0:.1f} mm, '
+            f'힘={force_raw / 10.0:.1f} N'
+        )
+
+    def _open_gripper_fully(self) -> None:
+        self._ensure_gripper()
+
+        max_force_raw = int(self._rg2.max_force)
+        force_raw = max(0, min(self._gripper_force_raw, max_force_raw))
+
+        with self._gripper_lock:
+            self._wait_gripper_idle()
+            self._rg2.open_gripper(force_val=force_raw)
+            # write 응답 직후 busy bit가 갱신될 시간을 조금 준다.
+            time.sleep(0.05)
+            self._wait_gripper_idle()
+
+        self.get_logger().info('RG2 완전 개방 완료')
+
+    def _wait_gripper_idle(self) -> None:
+        deadline = time.monotonic() + self._gripper_timeout_sec
+
+        while time.monotonic() < deadline:
+            flags = self._read_status_flags()
+            busy = flags[0] == 1
+            safety_error = any(flags[index] == 1 for index in (3, 5, 6))
+
+            if safety_error:
+                raise RuntimeError(f'RG2 safety 상태 발생: {flags}')
+            if not busy:
                 return
-            time.sleep(0.02)
 
-        if future.result() and not future.result().success:
-            self.get_logger().error(f'그리퍼 명령 실패: {command}')
+            time.sleep(self._gripper_poll_period_sec)
 
-    def _publish_result(self, class_name: str, success: bool, reason: str):
+        raise TimeoutError(
+            f'RG2 동작 타임아웃 ({self._gripper_timeout_sec:.1f}초)'
+        )
+
+    def _read_status_flags(self) -> list[int]:
+        """
+        onrobot.py의 get_status()는 polling할 때마다 표준출력을 발생시키므로,
+        같은 상태 레지스터(268)를 직접 읽어 조용히 bit flag만 반환한다.
+        """
+        self._ensure_gripper()
+
+        result = self._rg2.client.read_holding_registers(
+            address=268,
+            count=1,
+            unit=65,
+        )
+        self._check_modbus_result(result, 'status register read')
+
+        value = int(result.registers[0])
+        return [(value >> bit) & 0x1 for bit in range(7)]
+
+    def _read_grip_state(self) -> tuple[bool, float]:
+        self._ensure_gripper()
+
+        with self._gripper_lock:
+            flags = self._read_status_flags()
+            result = self._rg2.client.read_holding_registers(
+                address=275,
+                count=1,
+                unit=65,
+            )
+            self._check_modbus_result(result, 'width-with-offset register read')
+            width_mm = float(result.registers[0]) / 10.0
+
+        return flags[1] == 1, width_mm
+
+    @staticmethod
+    def _check_modbus_result(result: Any, operation: str) -> None:
+        if result is None:
+            raise RuntimeError(f'Modbus {operation}: 응답 없음')
+        if hasattr(result, 'isError') and result.isError():
+            raise RuntimeError(f'Modbus {operation} 실패: {result}')
+        if not hasattr(result, 'registers') or not result.registers:
+            raise RuntimeError(f'Modbus {operation}: registers 없음')
+
+    # ── 공통 유틸리티 ────────────────────────────────────────────────
+    @staticmethod
+    def _vector3(value: Any, default: Sequence[float]) -> list[float]:
+        source = default if value is None else value
+        if not isinstance(source, (list, tuple)) or len(source) != 3:
+            raise ValueError(f'3개 원소 벡터가 필요함: {source}')
+
+        result = [float(component) for component in source]
+        if not all(math.isfinite(component) for component in result):
+            raise ValueError(f'벡터에 유효하지 않은 값이 있음: {source}')
+        return result
+
+    @staticmethod
+    def _joint_vector(value: Any) -> Optional[list[float]]:
+        if value is None:
+            return None
+        if not isinstance(value, (list, tuple)) or len(value) != 6:
+            raise ValueError(f'관절값은 6개여야 함: {value}')
+
+        result = [float(component) for component in value]
+        if not all(math.isfinite(component) for component in result):
+            raise ValueError(f'관절값에 유효하지 않은 값이 있음: {value}')
+        return result
+
+    @staticmethod
+    def _positive_float(value: Any, field_name: str) -> float:
+        result = float(value)
+        if not math.isfinite(result) or result <= 0.0:
+            raise ValueError(f'{field_name}은 0보다 큰 유한값이어야 함: {value}')
+        return result
+
+    def _publish_result(self, class_name: str, success: bool, reason: str) -> None:
         msg = String()
-        msg.data = json.dumps({
-            'class_name': class_name,
-            'success':    success,
-            'reason':     reason,
-        }, ensure_ascii=False)
+        msg.data = json.dumps(
+            {
+                'class_name': class_name,
+                'success': success,
+                'reason': reason,
+            },
+            ensure_ascii=False,
+        )
         self.pub.publish(msg)
 
+    def destroy_node(self) -> bool:
+        if self._rg2 is not None:
+            try:
+                self._rg2.close_connection()
+                self.get_logger().info('OnRobot Modbus 연결 종료')
+            except Exception as exc:
+                self.get_logger().warning(f'OnRobot 연결 종료 중 오류: {exc}')
+            finally:
+                self._rg2 = None
 
-# ── 진입점 ────────────────────────────────────────────────────────────
-def main(args=None):
+        return super().destroy_node()
+
+
+def main(args: Optional[Sequence[str]] = None) -> None:
     global _DSR
 
     rclpy.init(args=args)
-    node = None
+    node: Optional[RobotExecutor] = None
 
     try:
-        # ★ 수정: 임시 노드를 만들었다가 destroy하는 방식은 근본적으로 잘못됨.
-        # DSR_ROBOT2는 import되는 순간 DR_init.__dsr__node로 등록된 노드를
-        # 이용해 내부적으로 서비스 클라이언트를 만들어 저장해 둔다.
-        # 그 노드를 곧바로 destroy()하면 이후 movej() 등을 호출할 때마다
-        # "cannot use Destroyable because destruction was requested" 에러가 난다.
-        #
-        # cobot2_grasp.py가 정상 동작하는 이유가 바로 이것: 거기서는 노드를
-        # 절대 중간에 destroy하지 않고 프로그램이 끝날 때까지 그대로 유지한다.
-        #
-        # → 실제로 계속 살아있을 RobotExecutor를 먼저 생성하고, 그 노드를
-        #   그대로 DR_init에 등록한다. 임시 노드도, 중간 destroy도 없앤다.
+        # DSR_ROBOT2 import 전에 실제로 계속 살아 있을 노드를 DR_init에 등록한다.
         node = RobotExecutor()
 
         DR_init.__dsr__id = ROBOT_ID
@@ -357,46 +626,42 @@ def main(args=None):
         DR_init.__dsr__node = node
 
         from DSR_ROBOT2 import (
-            movel, movej, movejx,
-            set_tool, set_tcp,
-            set_digital_output, get_digital_input,
-            get_current_posx, get_current_posj,
+            get_current_posj,
+            get_current_posx,
+            get_digital_input,
+            movej,
+            movejx,
+            movel,
+            set_digital_output,
+            set_tcp,
+            set_tool,
             wait,
         )
-        from DR_common2 import posx, posj
+        from DR_common2 import posj, posx
 
         _DSR = {
-            'movel': movel, 'movej': movej, 'movejx': movejx,
-            'set_tool': set_tool, 'set_tcp': set_tcp,
+            'movel': movel,
+            'movej': movej,
+            'movejx': movejx,
+            'set_tool': set_tool,
+            'set_tcp': set_tcp,
             'set_digital_output': set_digital_output,
             'get_digital_input': get_digital_input,
             'get_current_posx': get_current_posx,
             'get_current_posj': get_current_posj,
-            'posx': posx, 'posj': posj,
+            'posx': posx,
+            'posj': posj,
             'wait': wait,
         }
-
-        # ★ 추가: movesj(스플라인 관절이동) — 있으면 여러 웨이포인트를
-        # 하나의 매끄러운 동작으로 실행하는 데 사용(_exec_trajectory 참고).
-        # DSR_ROBOT2 버전에 따라 이름이 다르거나 없을 수 있어 별도로
-        # 안전하게 시도하고, 실패해도 movej/movejx 위주 폴백으로 동작.
-        try:
-            from DSR_ROBOT2 import movesj
-            _DSR['movesj'] = movesj
-            node.get_logger().info('movesj(스플라인 이동) 사용 가능')
-        except ImportError:
-            node.get_logger().warn(
-                'movesj 없음 — 궤적 실행 시 최종 목표점으로만 이동(폴백)')
-
         node.get_logger().info('두산 API import 완료 (DSR 활성화)')
 
-    except ImportError as e:
+    except Exception as exc:
         if node is None:
-            # DSR import 실패 시에도 RobotExecutor는 반드시 생성해야 함
             node = RobotExecutor()
-        node.get_logger().warn(f'DSR_ROBOT2 import 실패: {e} → DSR 없이 실행')
+        node.get_logger().error(f'DSR_ROBOT2 초기화 실패: {exc}')
 
     from rclpy.executors import MultiThreadedExecutor
+
     executor = MultiThreadedExecutor()
     executor.add_node(node)
 
@@ -405,6 +670,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        executor.remove_node(node)
         node.destroy_node()
         rclpy.shutdown()
 
