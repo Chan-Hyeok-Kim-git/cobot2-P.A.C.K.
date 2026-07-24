@@ -69,8 +69,25 @@ JOINT_ACC = 30
 
 LIFT_HEIGHT_MM = 100.0
 
-BIN_JOINT_DEG = [781.1, -162.0, 214.0, 150.0, -155.0, -15.0]
+# ★ 수정: 티치펜던트 Global_bag1 최신값 반영 (기존 Global_bag 값에서 갱신됨)
+# posx 형식: [X_mm, Y_mm, Z_mm, A_deg, B_deg, C_deg]
+BIN_JOINT_DEG = [742.650, 44.540, 119.880, 3.14, 147.01, -179.74]
 HOME_JOINT_DEG = [0.0, 0.0, 90.0, 0.0, 90.0, 180.0]
+
+# ★ 추가: 선반 스캔 웨이포인트 — task_manager와의 메시지 왕복(웨이포인트마다
+# goto→reached 주고받기)이 반복적으로 막히는 문제가 있어서, 이제 이 노드
+# 안에서 6곳을 통째로 순서대로 도는 하드코딩 시퀀스로 단순화한다.
+# task_manager는 "스캔 시작" 트리거 한 번만 보내면 됨.
+# posx 형식: [X_mm, Y_mm, Z_mm, A_deg, B_deg, C_deg] — 티치펜던트 실측치
+SCAN_WAYPOINTS = [
+    {"name": "top_center",    "pose_mm_deg": [270.51, -225.75, 374.59,  95.92, -137.84, -75.25]},
+    {"name": "top_left",      "pose_mm_deg": [405.32, -206.32, 418.33, 126.37, -130.36, -52.44]},
+    {"name": "top_right",     "pose_mm_deg": [221.11, -217.30, 395.61,  70.54, -137.55, -91.54]},
+    {"name": "bottom_center", "pose_mm_deg": [338.73, -187.66, 196.48,  94.67, -122.86, -87.68]},
+    {"name": "bottom_left",   "pose_mm_deg": [466.98, -157.22, 204.59, 118.40, -120.53, -77.75]},
+    {"name": "bottom_right",  "pose_mm_deg": [243.95, -173.65, 176.19,  75.11, -127.02, -93.18]},
+]
+SCAN_DWELL_SEC = 2.0  # 각 웨이포인트 도착 후 물체 인식이 안정될 때까지 대기하는 시간
 
 
 class RobotExecutor(Node):
@@ -110,10 +127,26 @@ class RobotExecutor(Node):
         self.create_subscription(String, '/grasp_result', self._on_grasp_result, 10, callback_group=self._cb_group)
         self.pub = self.create_publisher(String, '/execution_result', 10)
 
+        # ★ 수정: 웨이포인트마다 좌표를 주고받던 방식(scan_goto/scan_reached)이
+        # 반복적으로 콜백 전달이 막히는 문제가 있어서, "스캔 시작해" 트리거
+        # 하나만 받으면 이 노드 안에서 SCAN_WAYPOINTS 6곳을 통째로 순서대로
+        # 도는 방식으로 단순화했다. task_manager는 좌표를 몰라도 됨.
+        self.create_subscription(
+            String, '/task/start_scan', self._on_start_scan, 10,
+            callback_group=self._cb_group)
+        self.scan_complete_pub = self.create_publisher(String, '/task/scan_complete', 10)
+
         self._connect_gripper()
 
         self._worker_thread = threading.Thread(target=self._worker, name='cobot2_move_worker', daemon=True)
         self._worker_thread.start()
+
+        # ★ 진단용 추가: executor가 실제로 살아서 콜백을 계속 처리하고 있는지
+        # 확인하기 위한 heartbeat. 이게 1초마다 안 찍히면 executor.spin() 자체가
+        # 멈춘 것이고, 계속 찍히는데 scan_goto만 안 받으면 이 토픽/콜백 쪽만의
+        # 문제(QoS, 콜백그룹 경합 등)로 원인을 좁힐 수 있다.
+        self._heartbeat_count = 0
+        self.create_timer(1.0, self._heartbeat)
 
         self.get_logger().info('RobotExecutor 준비 완료')
 
@@ -128,6 +161,64 @@ class RobotExecutor(Node):
             return
         self._queue.put(plan)
         self.get_logger().info(f"[{plan.get('class_name', '?')}] 큐 추가 (현재 큐 크기={self._queue.qsize()})")
+
+    def _heartbeat(self) -> None:
+        self._heartbeat_count += 1
+        with self._state_lock:
+            busy = self._busy
+        self.get_logger().info(
+            f'[heartbeat {self._heartbeat_count}] executor 살아있음 | busy={busy} | '
+            f'큐 크기={self._queue.qsize()}'
+        )
+
+    def _on_start_scan(self, msg: String) -> None:
+        """★ 재설계: 웨이포인트마다 좌표를 주고받던 방식(scan_goto/scan_reached)이
+        반복적으로(4번 연속) 정확히 같은 지점에서 콜백 전달이 막히는 문제가
+        있었다. 원인을 여러 각도로 좁혀봤지만(폴링 제거, 워커스레드→콜백
+        직접실행 전환 등) 여전히 재현됐던 걸로 보아, 메시지를 여러 번 주고받는
+        구조 자체가 문제의 핵심일 가능성이 높다고 판단해 아예 그 구조를
+        없앴다.
+
+        이제 task_manager는 "스캔 시작해" 트리거 딱 1번만 보내면 되고,
+        이 콜백이 SCAN_WAYPOINTS 6곳을 전부 순서대로(하드코딩된 순서) 돌면서
+        각 자리마다 SCAN_DWELL_SEC만큼 머문다. 그 동안 cobot2_grasp가
+        object_points를 계속 받아서 class_id로 매칭 → 성공하면 자체적으로
+        ValidatedGrasp를 발행 → mi_node → /motion_plan → 이 노드의 기존
+        파지 실행 경로(_execute, 별도 워커 스레드/큐)로 자연스럽게 넘어간다.
+        (그 파지 실행 경로는 여러 번 실제로 성공 검증된 적이 있어서 안 건드림)
+
+        6곳 다 돌고도 아무 물체도 못 찾았으면 /task/scan_complete를 발행해서
+        task_manager에게 "이번 물품 못 찾음"을 알린다. 중간에 물체를 찾아서
+        파지가 진행되면, task_manager는 (기존처럼) /execution_result를 보고
+        먼저 반응하면 되므로 이 스캔 시퀀스가 끝까지 도는 것과 상관없다.
+        """
+        with self._state_lock:
+            if self._busy:
+                self.get_logger().warning('현재 다른 동작(파지 등) 실행 중이라 스캔 요청을 무시함')
+                return
+            self._busy = True
+
+        self.get_logger().info(f'전체 스캔 시작 — 웨이포인트 {len(SCAN_WAYPOINTS)}곳 순회')
+        try:
+            for i, wp in enumerate(SCAN_WAYPOINTS):
+                self.get_logger().info(
+                    f'스캔 {i+1}/{len(SCAN_WAYPOINTS)} ({wp["name"]}) 이동 시작'
+                )
+                self._execute_scan(wp)
+                self.get_logger().info(
+                    f'스캔 {i+1}/{len(SCAN_WAYPOINTS)} ({wp["name"]}) 도착 — '
+                    f'{SCAN_DWELL_SEC:.1f}초 대기(물체 인식 안정화)'
+                )
+                time.sleep(SCAN_DWELL_SEC)
+
+            self.scan_complete_pub.publish(String(data='done'))
+            self.get_logger().info('전체 스캔 완료 (6곳 다 돌았음)')
+        except Exception as exc:
+            self.get_logger().error(f'스캔 시퀀스 오류: {exc}')
+            self.scan_complete_pub.publish(String(data='error'))
+        finally:
+            with self._state_lock:
+                self._busy = False
 
     def _on_grasp_result(self, msg: String) -> None:
         try:
@@ -150,7 +241,10 @@ class RobotExecutor(Node):
             with self._state_lock:
                 self._busy = True
             try:
-                self._execute(plan)
+                if isinstance(plan, dict) and plan.get('__scan__'):
+                    self._execute_scan(plan)
+                else:
+                    self._execute(plan)
             except Exception as exc:
                 name = plan.get('class_name', '?') if isinstance(plan, dict) else '?'
                 self.get_logger().error(f'[{name}] 실행 오류: {exc}')
@@ -159,6 +253,49 @@ class RobotExecutor(Node):
                 with self._state_lock:
                     self._busy = False
                 self._queue.task_done()
+
+    def _execute_scan(self, plan: dict) -> None:
+        """스캔 웨이포인트로 이동만 하고 파지 사이클은 실행하지 않는다.
+
+        ★ 재수정: movel()이 실제로 블로킹된다는 게 실측으로 증명됐다
+        (첫 실측 테스트에서 11.7초 걸려 실제 이동 완료를 확인함).
+        그런데 그 뒤에 안전을 위해 추가했던 get_current_posx() 반복 폴링
+        루프가, 두 번째 스캔 웨이포인트 메시지 콜백이 아예 안 들어오는
+        새로운 버그를 만들어냈다 (재현 100%, 항상 폴링을 거친 첫 웨이포인트
+        직후 두 번째 웨이포인트에서 멈춤). Doosan DSR_ROBOT2의 get_current_posx는
+        내부적으로 자체 ROS 통신을 하는 것으로 보이는데, 이걸 while 루프
+        안에서 반복 호출하는 게 cobot2_move 자신의 MultiThreadedExecutor
+        spin과 충돌해서 이후 구독 콜백 전달이 깨지는 것으로 추정된다.
+        (기존에 안정적으로 동작했던 파지 시퀀스 _execute()는 get_current_posx를
+        반복 호출하지 않고 필요할 때 한 번씩만 불렀다 — 그 패턴으로 되돌린다.)
+
+        따라서 폴링을 완전히 제거하고, 이미 실측으로 검증된 movel()의
+        블로킹 리턴을 그대로 신뢰한다. 도착 확인용 TCP 조회도 폴링이 아니라
+        이동 후 딱 한 번만 한다(로그 확인용, 재시도 없음).
+        """
+        if not _DSR:
+            raise RuntimeError('DSR 함수가 바인딩되지 않음')
+        movel = _DSR['movel']
+        posx = _DSR['posx']
+        get_current_posx = _DSR['get_current_posx']
+        dr_base = _DSR['DR_BASE']
+        pose = plan['pose_mm_deg']
+
+        self.get_logger().info(
+            f'스캔 이동 시작(movel) → posx({pose[0]:.1f}, {pose[1]:.1f}, {pose[2]:.1f}, '
+            f'{pose[3]:.2f}, {pose[4]:.2f}, {pose[5]:.2f})'
+        )
+        movel(posx(*pose), vel=VELOCITY, acc=ACC)  # 블로킹 — 리턴하면 이동 완료된 것으로 신뢰
+
+        # 도착 후 딱 한 번만 실측 TCP 확인 (재시도 폴링 없음, 로그용)
+        try:
+            cur_posx, _ = get_current_posx(ref=dr_base)
+            self.get_logger().info(
+                f'스캔 이동 완료, 실측 TCP = ({float(cur_posx[0]):.1f}, '
+                f'{float(cur_posx[1]):.1f}, {float(cur_posx[2]):.1f})'
+            )
+        except Exception as e:
+            self.get_logger().warning(f'이동 후 TCP 조회 실패(치명적이지 않음): {e}')
 
     def _execute(self, plan: dict) -> None:
         if not _DSR:
@@ -432,6 +569,7 @@ def main(args=None) -> None:
         from DSR_ROBOT2 import (
             get_current_posj, get_current_posx, get_digital_input,
             movej, movejx, movel, set_digital_output, set_tcp, set_tool, wait,
+            DR_BASE,
         )
         from DR_common2 import posj, posx
 
@@ -443,6 +581,7 @@ def main(args=None) -> None:
             'get_current_posx': get_current_posx,
             'get_current_posj': get_current_posj,
             'posx': posx, 'posj': posj, 'wait': wait,
+            'DR_BASE': DR_BASE,
         }
 
         # ★ 추가: movesj(스플라인 관절이동) — 있으면 _exec_trajectory가

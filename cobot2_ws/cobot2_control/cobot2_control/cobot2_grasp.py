@@ -4,9 +4,13 @@ import numpy as np
 import rclpy
 import DR_init
 
+from collections import deque
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import PointCloud2
 from geometry_msgs.msg import PoseStamped
+from scipy.spatial import cKDTree
+from std_msgs.msg import String
 
 from cobot2_interfaces.msg import ValidatedGrasp
 
@@ -18,90 +22,120 @@ from cobot2_interfaces.msg import ValidatedGrasp
 ROBOT_ID    = "dsr01"
 ROBOT_MODEL = "m0609"
 
-# 두산 드라이버(DR_init)에 어떤 로봇을 쓸지 전역으로 등록
-# 이 두 줄이 없으면 DSR_ROBOT2의 함수들이 어떤 로봇에 명령할지 모름
 DR_init.__dsr__id    = ROBOT_ID
 DR_init.__dsr__model = ROBOT_MODEL
 
 
 # ============================================================
-# 2. 그리퍼 치수 (rg2_collision.yaml 실측값, 단위: meter)
-#
-#  [TCP 기준 로컬 좌표계]  ← 이 좌표계로 충돌 박스를 정의
-#
-#    TCP(손끝) = 원점 (0, 0, 0)
-#    +Z = 본체(마운트) 방향  ← TCP에서 로봇팔 쪽
-#    -Z = 물체 방향          ← TCP에서 물체 쪽 (손끝 앞)
-#    +Y = 손가락이 닫히는 방향
-#
-#  z축 영역:
-#    본체   z: 0      ~ +0.132  (TCP 뒤쪽)
-#    손가락 z: -0.055 ~  0      (TCP 앞쪽, 물체 잡는 부분)
+# 2. 그리퍼 치수
 # ============================================================
 
-GRIPPER_MAX_OPENING = 0.100   # RG2 최대 개폐폭 — 이보다 넓은 물체는 못 잡음
-GRIPPER_MARGIN      = 0.005   # 안전 여유 — 물체폭 + MARGIN <= MAX_OPENING 이어야 파지 가능
-FINGER_THICKNESS    = 0.012   # 손가락 두께 (x방향, 로컬 좌표 기준)
-FINGER_LENGTH       = 0.055   # 손가락 길이 (z방향, TCP 앞쪽으로 뻗은 길이)
-FINGER_WIDTH        = 0.020   # 손가락 폭 (y방향, 물체 잡는 면의 폭)
-BODY_SIZE_X         = 0.036   # 본체 x 크기
-BODY_SIZE_Y         = 0.075   # 본체 y 크기
-BODY_SIZE_Z         = 0.132   # 본체 z 크기 (TCP 뒤쪽으로 뻗은 길이)
-TOTAL_LENGTH        = 0.213   # 마운트~TCP 전체 길이 (rg2_collision.yaml 실측)
+GRIPPER_MAX_OPENING = 0.100
+GRIPPER_MARGIN      = 0.005
+FINGER_THICKNESS    = 0.012
+FINGER_LENGTH       = 0.055
+FINGER_WIDTH        = 0.020
+BODY_SIZE_X         = 0.036
+BODY_SIZE_Y         = 0.075
+BODY_SIZE_Z         = 0.132
+TOTAL_LENGTH        = 0.213
 
-COLLISION_THRESHOLD = 5       # 박스 안에 이 점 개수 이상이면 충돌로 판정
-PREGRASP_DISTANCE   = 0.100   # pre-grasp 시작 거리 — grasp에서 이 거리만큼 물러난 위치
-APPROACH_STEP       = 0.010   # 접근 경로 충돌 검사 간격 (10mm마다 한 번씩 검사)
-
-# ★ 수정: 티치펜던트 Robot Limits(일반모드) 실측값으로 교체.
-# 이전에는 moveit joint_limits.yaml(라디안 → 도 변환값)을 그대로 썼는데,
-# J1/J3/J4/J6에서 실제 DSR 네이티브 컨트롤러의 운영 제한(티치펜던트에
-# 표시된 값)과 달랐다 — moveit 쪽이 더 보수적으로(좁게) 설정되어 있었음.
-#
-# 이 상수는 DSR ikin()이 계산한 해가 "실제 로봇 컨트롤러가 받아줄 수
-# 있는 범위"인지 미리 거르는 용도이므로, MoveIt의 자체 제약이 아니라
-# DSR 실제 운영 제한(티치펜던트 Robot Limits → 일반 모드)을 기준으로
-# 삼아야 한다. (MoveIt은 cobot2_mi_node에서 별도로 자기 자신의
-# joint_limits.yaml을 이미 적용하므로, 여기서 더 좁게 잡을 필요 없음)
-#
-# 확인 사진(2026-07-22) 기준:
-#   J1 ±360 | J2 ±95 | J3 ±135 | J4 ±360 | J5 ±135 | J6 ±360
-MOVEIT_JOINT_LIMITS_DEG = [
-    (-360.0, 360.0),   # joint_1  (이전 ±180 → 실측 ±360으로 수정)
-    ( -95.0,  95.0),   # joint_2  (실측과 일치, 변경 없음)
-    (-135.0, 135.0),   # joint_3  (이전 ±125 → 실측 ±135로 수정)
-    (-360.0, 360.0),   # joint_4  (이전 ±180 → 실측 ±360으로 수정)
-    (-135.0, 135.0),   # joint_5  (실측과 일치, 변경 없음)
-    (-360.0, 360.0),   # joint_6  (이전 ±180 → 실측 ±360으로 수정)
-]
-
-# 제한 경계에 너무 가까운 자세를 피하기 위한 여유
-JOINT_LIMIT_MARGIN_DEG = 1.0
+COLLISION_THRESHOLD = 5
+PREGRASP_DISTANCE   = 0.100
+APPROACH_STEP       = 0.010
 
 
 # ============================================================
-# 3. 선반 설정 (shelf_collision.yaml 실측값)
-#
-#  shelf_floor center z=0.00 → 바닥 윗면 z ≈ 0.005m
-#  shelf_back  center z=0.24 → 천장 아랫면 z ≈ 0.235m
-#  → 실제 사용 가능 수직 공간 ≈ 0.235m
-#
-#  TOP 파지 필요 공간 계산:
-#    TOTAL_LENGTH(0.213) + 안전여유(0.030) = 0.243m
-#    0.235m < 0.243m → 이 선반에서는 항상 FRONT 파지
+# 3. 선반 설정
 # ============================================================
 
-SHELF_USABLE_HEIGHT = 0.235                 # 선반 칸 유효 높이 (실측)
-REQUIRED_TOP_SPACE  = TOTAL_LENGTH + 0.030  # TOP 파지에 필요한 최소 수직 공간 (0.243m)
+SHELF_USABLE_HEIGHT = 0.235
+REQUIRED_TOP_SPACE  = TOTAL_LENGTH + 0.030
 
 
 # ============================================================
-# 4. ROS 토픽명 (비전팀 토픽명에 맞게 수정 필요)
+# 4. ROS 토픽명
 # ============================================================
 
-TARGET_CLOUD_TOPIC      = "/grasp/target_cloud"       # 물체 표면 점군
-ENVIRONMENT_CLOUD_TOPIC = "/grasp/environment_cloud"  # 환경(선반/주변) 점군
-GRASP_RESULT_TOPIC      = "/grasp/validated_grasp"  # IK까지 통과한 파지 후보 발행
+TARGET_CLOUD_TOPIC      = "/ai/object_points_base"
+ENVIRONMENT_CLOUD_TOPIC = "/ai/background_points_base"
+EXPECTED_CLOUD_FRAME     = "base_link"
+GRASP_RESULT_TOPIC      = "/grasp/validated_grasp"
+
+# ★ 삭제됨: hand-eye 캘리브레이션(T_gripper2camera.npy) 로드 관련 코드 전부 제거.
+# vision 쪽에서 이제 카메라→base_link 변환을 이미 끝낸 point cloud를 직접
+# 보내주기로 했으므로, 이 노드가 다시 변환할 필요가 없어졌다.
+
+# ★ 추가: target_cloud에 여러 물체가 섞여서 오므로, 그중 지금 찾는 물품(active_item)의
+# 뭉치만 골라내기 위한 클러스터링 + 크기매칭 설정.
+ACTIVE_ITEM_TOPIC = "/task/active_item"
+
+CLUSTER_EPS_MM = 25.0        # 이 거리(mm) 안의 점들을 같은 물체로 묶음
+CLUSTER_MIN_POINTS = 15      # 이보다 점이 적은 뭉치는 노이즈로 버림
+MATCH_MAX_DIST_MM = 60.0     # 이보다 멀면 매칭 실패로 간주
+
+# 각 class를 PCA로 정렬했을 때 3개 주축 길이를 오름차순 정렬한 값 (mm)
+# ★ 실측치로 교체 필요
+CLASS_DIMENSIONS_MM = {
+    "gas_mask":   (120.0, 180.0, 220.0),
+    "flashlight": (30.0,  35.0,  200.0),
+    "rope":       (70.0,  70.0,  90.0),
+}
+
+
+def cluster_points(points_m: np.ndarray, eps_mm: float, min_points: int) -> list:
+    """가까운 점끼리 묶어서 물체 단위 뭉치로 분리 (DBSCAN 스타일, cKDTree 사용)."""
+    if points_m.shape[0] == 0:
+        return []
+    eps_m = eps_mm / 1000.0
+    tree = cKDTree(points_m)
+    n = points_m.shape[0]
+    visited = np.zeros(n, dtype=bool)
+    clusters = []
+    for i in range(n):
+        if visited[i]:
+            continue
+        stack = [i]
+        visited[i] = True
+        members = [i]
+        while stack:
+            cur = stack.pop()
+            for nb in tree.query_ball_point(points_m[cur], eps_m):
+                if not visited[nb]:
+                    visited[nb] = True
+                    stack.append(nb)
+                    members.append(nb)
+        if len(members) >= min_points:
+            clusters.append(points_m[members])
+    return clusters
+
+
+def _sorted_extents_mm(points_m: np.ndarray) -> np.ndarray:
+    """PCA로 물체를 정렬한 뒤 3개 주축 길이를 오름차순 반환 (mm). 회전에 무관."""
+    center = points_m.mean(axis=0)
+    centered = points_m - center
+    cov = np.cov(centered.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    local = centered @ eigvecs
+    extents = local.max(axis=0) - local.min(axis=0)
+    return np.sort(extents * 1000.0)
+
+
+def classify_cluster(points_m: np.ndarray) -> tuple:
+    """클러스터 크기를 CLASS_DIMENSIONS_MM과 비교해 가장 가까운 class 반환.
+    반환: (class_name 또는 None, 거리mm)"""
+    if points_m.shape[0] < 4:
+        return None, float('inf')
+    extents = _sorted_extents_mm(points_m)
+    best_name, best_dist = None, float('inf')
+    for name, ref in CLASS_DIMENSIONS_MM.items():
+        ref_sorted = np.sort(np.array(ref, dtype=float))
+        dist = float(np.linalg.norm(extents - ref_sorted))
+        if dist < best_dist:
+            best_name, best_dist = name, dist
+    if best_dist > MATCH_MAX_DIST_MM:
+        return None, best_dist
+    return best_name, best_dist
 
 
 # ============================================================
@@ -113,28 +147,38 @@ class GraspValidatorNode(Node):
     def __init__(self):
         super().__init__("grasp_validator", namespace=ROBOT_ID)
 
-        # 두산 API 등록/import는 main()에서 노드 생성이 완전히 끝난 뒤 수행한다.
-        # super().__init__()과 클래스의 나머지 구조는 그대로 유지한다.
-
-        # 두 점군을 별도로 저장 — 둘 다 도착해야 검증 시작 (게이트 패턴)
-        self.target_points      = None   # (N,3) numpy 배열 — 물체 표면 점군
-        self.environment_points = None   # (M,3) numpy 배열 — 선반/주변 환경 점군
+        self.target_points      = None
+        self.environment_points = None
         self.validation_pending = False
 
-        # ★ [추가] 물체가 상부/하부 선반에 있는지 구분하는 변수
-        #   비전팀이 별도 토픽으로 알려주면 여기에 저장
-        #   현재는 기본값 'bottom' 사용 (실제 연동 시 구독 추가 필요)
-        self.object_layer = 'bottom'  # 'top' 또는 'bottom'
+        self.object_layer = 'bottom'
 
-        # 비전팀 점군 구독
-        self.create_subscription(
-            PointCloud2, TARGET_CLOUD_TOPIC,
-            self.target_cloud_callback, 10)
-        self.create_subscription(
-            PointCloud2, ENVIRONMENT_CLOUD_TOPIC,
-            self.environment_cloud_callback, 10)
+        # ★ 삭제됨: T_gripper2cam 로드 블록 (더 이상 이 노드에서 좌표 변환을 안 함)
 
-        # 폭/충돌/접근경로/두산 IK까지 통과한 후보만 MoveIt 검증 노드로 발행
+        # ★ 추가: 지금 어떤 물품을 찾는 중인지 (task_manager가 알려줌).
+        # target_cloud에 여러 물체가 섞여 오므로, 이 값과 매칭되는 클러스터만
+        # target_points로 사용한다. 빈 문자열이면 아무것도 처리 안 함.
+        self.active_item = ""
+        # ★ 추가: 이번 active_item에 대해 이미 ValidatedGrasp를 발행했는지.
+        # vision이 계속 스트리밍하는 동안 매 프레임마다 재검증·재발행하면
+        # 같은 물체를 여러 번 집으려 드는 문제가 생기므로, 한 번 발행하면
+        # active_item이 바뀔 때까지 더 이상 처리하지 않는다.
+        self._published_for_current_item = False
+        self.create_subscription(String, ACTIVE_ITEM_TOPIC, self.on_active_item, 10)
+
+        self.create_subscription(
+            PointCloud2,
+            TARGET_CLOUD_TOPIC,
+            self.target_cloud_callback,
+            qos_profile_sensor_data,
+        )
+        self.create_subscription(
+            PointCloud2,
+            ENVIRONMENT_CLOUD_TOPIC,
+            self.environment_cloud_callback,
+            qos_profile_sensor_data,
+        )
+
         self.result_pub = self.create_publisher(
             ValidatedGrasp, GRASP_RESULT_TOPIC, 10)
 
@@ -145,12 +189,7 @@ class GraspValidatorNode(Node):
             f"→ 이 선반은 항상 FRONT 파지"
         )
 
-    # ──────────────────────────────────────────────────────────────
-    # 두산 API 로드
-    # ──────────────────────────────────────────────────────────────
-
     def _load_doosan_api(self):
-        # ★ 수정: DSR 변수 먼저 None 초기화 → import 실패해도 노드 살아있음
         self.dsr_ikin             = None
         self.dsr_get_current_posj = None
         self.dsr_get_current_posx = None
@@ -160,14 +199,13 @@ class GraspValidatorNode(Node):
 
         try:
             from DSR_ROBOT2 import (
-                ikin,              # Inverse Kinematics — pose → 관절각도
-                get_current_posj,  # 현재 관절 각도 조회
-                get_current_posx,  # 현재 TCP 위치 조회
-                DR_BASE,           # 좌표계 상수 (base_link 기준)
+                ikin,
+                get_current_posj,
+                get_current_posx,
+                DR_BASE,
             )
-            from DR_common2 import posx  # 위치 자료형 생성 함수
+            from DR_common2 import posx
 
-            # 인스턴스 변수로 바인딩
             self.dsr_ikin             = ikin
             self.dsr_get_current_posj = get_current_posj
             self.dsr_get_current_posx = get_current_posx
@@ -177,56 +215,89 @@ class GraspValidatorNode(Node):
             self.get_logger().info("두산 API import 완료")
 
         except ImportError as e:
-            # ★ raise 제거 — bringup 없어도 노드 실행 (IK 스킵 모드)
             self.get_logger().warn(
                 f"두산 API 없음: {e} → IK 스킵 모드로 동작"
             )
 
-    # ──────────────────────────────────────────────────────────────
-    # 콜백 — 점군 수신
-    # ──────────────────────────────────────────────────────────────
+    # ★ 삭제됨: get_robot_pose_matrix(), transform_cloud_to_base() —
+    # 카메라→base_link 변환 로직 전체. vision이 이미 base_link 좌표로
+    # 변환해서 주므로 이 노드에서 다시 변환할 필요가 없어졌다.
+
+    def on_active_item(self, msg: String) -> None:
+        """task_manager가 '지금 이 물품을 찾는 중'이라고 알려주면 저장.
+        바뀌면 이전 물품의 잔여 상태를 초기화한다."""
+        new_item = msg.data
+        if new_item == self.active_item:
+            return
+        self.active_item = new_item
+        self.target_points = None
+        self.environment_points = None
+        self._published_for_current_item = False
 
     def target_cloud_callback(self, msg: PointCloud2):
-        """비전팀의 '물체 점군' 수신 → numpy 변환 → 검증 시도"""
-        self.target_points = self.pointcloud2_to_numpy(msg)
-        self.get_logger().debug(f"target cloud: {len(self.target_points)}점")
+        if not self.active_item or self._published_for_current_item:
+            return  # gate 닫힘 또는 이번 물품은 이미 발행 완료 — 재처리 안 함
+
+        if msg.header.frame_id != EXPECTED_CLOUD_FRAME:
+            self.get_logger().warn(
+                f"목표 점군 frame_id 오류: expected={EXPECTED_CLOUD_FRAME}, "
+                f"received={msg.header.frame_id}"
+            )
+            return
+
+        # ★ 수정: vision이 이미 base_link 좌표로 변환해서 주므로,
+        # 예전처럼 get_current_posx()로 로봇 자세를 읽어서 변환하는 과정이
+        # 통째로 빠졌다. 받은 점을 그대로 base_link 좌표로 사용한다.
+        base_pts = self.pointcloud2_to_numpy(msg)
+        if len(base_pts) == 0:
+            return
+
+        # ★ 핵심: 섞인 점들을 물체 단위로 분리(클러스터링) →
+        # 각 뭉치 크기를 CLASS_DIMENSIONS_MM과 비교(크기매칭) →
+        # active_item과 일치하는 뭉치만 골라서 target_points로 사용
+        clusters = cluster_points(base_pts, CLUSTER_EPS_MM, CLUSTER_MIN_POINTS)
+        matched_cluster, best_dist = None, float('inf')
+        for cluster in clusters:
+            name, dist = classify_cluster(cluster)
+            if name == self.active_item and dist < best_dist:
+                matched_cluster, best_dist = cluster, dist
+
+        if matched_cluster is None:
+            self.get_logger().debug(
+                f"[{self.active_item}] 이번 프레임에서 매칭되는 뭉치 없음 "
+                f"(클러스터 {len(clusters)}개 중 매칭 실패) — 대기"
+            )
+            self.target_points = None
+            return
+
+        self.get_logger().debug(
+            f"[{self.active_item}] 매칭 성공: {matched_cluster.shape[0]}점, "
+            f"매칭거리={best_dist:.1f}mm"
+        )
+        self.target_points = matched_cluster
         self.try_run_validation()
 
     def environment_cloud_callback(self, msg: PointCloud2):
-        """비전팀의 '환경 점군' 수신 → numpy 변환 → 검증 시도"""
+        if not self.active_item or self._published_for_current_item:
+            return  # target과 동일한 gate 적용
+
+        if msg.header.frame_id != EXPECTED_CLOUD_FRAME:
+            self.get_logger().warn(
+                f"환경 점군 frame_id 오류: expected={EXPECTED_CLOUD_FRAME}, "
+                f"received={msg.header.frame_id}"
+            )
+            return
+
+        # ★ 수정: 여기도 마찬가지로 변환 없이 받은 좌표를 그대로 사용
         self.environment_points = self.pointcloud2_to_numpy(msg)
-        self.get_logger().debug(f"environment cloud: {len(self.environment_points)}점")
         self.try_run_validation()
 
     def try_run_validation(self):
-        """
-        게이트(Gate) 패턴:
-        target / environment 두 점군이 모두 도착했을 때만 검증 실행.
-        하나만 왔을 때 실행하면 불완전한 정보로 잘못된 판단을 할 수 있음.
-        """
         if self.target_points is None or self.environment_points is None:
-            return  # 아직 둘 다 안 왔으면 대기
+            return
         self.validation_pending = True
 
-    # ──────────────────────────────────────────────────────────────
-    # [함수 1] pointcloud2_to_numpy  ← 신규 구현
-    #
-    # PointCloud2 메시지는 바이너리 형태로 저장되어 있다.
-    #
-    # 메시지 구조:
-    #   msg.fields    → 각 채널(x, y, z, intensity 등)의 이름 + 바이트 오프셋
-    #   msg.point_step → 점 하나당 바이트 수 (x,y,z float32 = 12바이트)
-    #   msg.width      → 점의 총 개수
-    #   msg.data       → 실제 바이트 데이터 (바이너리)
-    #
-    # 읽는 방법:
-    #   i번째 점의 시작 바이트 = i * point_step
-    #   x값 = struct.unpack_from('<f', data, 시작바이트 + x_offset)[0]
-    #   '<f' = 리틀엔디안 float32 (대부분의 카메라가 이 형식)
-    # ──────────────────────────────────────────────────────────────
-
     def pointcloud2_to_numpy(self, msg: PointCloud2) -> np.ndarray:
-        # fields에서 x, y, z 각각의 바이트 오프셋을 찾아 딕셔너리에 저장
         offsets = {}
         for field in msg.fields:
             if field.name in ('x', 'y', 'z'):
@@ -236,39 +307,22 @@ class GraspValidatorNode(Node):
             self.get_logger().warn("PointCloud2에 x/y/z 필드 없음")
             return np.zeros((0, 3), dtype=np.float32)
 
-        x_off = offsets['x']  # x채널이 점 시작바이트에서 몇 바이트 뒤에 있는지
+        x_off = offsets['x']
         y_off = offsets['y']
         z_off = offsets['z']
 
-        n_pts = msg.width * msg.height  # 총 점 개수 (height=1이면 width=점 개수)
-        step  = msg.point_step          # 점 하나당 바이트 수
-        data  = bytes(msg.data)         # 바이트 배열로 변환
+        n_pts = msg.width * msg.height
+        step  = msg.point_step
+        data  = bytes(msg.data)
 
         pts = np.zeros((n_pts, 3), dtype=np.float32)
         for i in range(n_pts):
-            base = i * step  # i번째 점의 시작 바이트 위치
+            base = i * step
             pts[i, 0] = struct.unpack_from('<f', data, base + x_off)[0]
             pts[i, 1] = struct.unpack_from('<f', data, base + y_off)[0]
             pts[i, 2] = struct.unpack_from('<f', data, base + z_off)[0]
 
-        # 깊이 카메라는 가끔 NaN(측정 불가) 또는 Inf(무한) 값을 내보냄 → 제거
         return pts[np.isfinite(pts).all(axis=1)]
-
-    # ──────────────────────────────────────────────────────────────
-    # [함수 2] calculate_required_width  ← 신규 구현
-    #
-    # "이 방향으로 손가락이 닫힐 때 물체를 잡으려면 얼마나 벌어야 하나?"
-    #
-    # 핵심 아이디어: 투영(내적)
-    #   물체의 모든 점을 closing_direction 벡터에 내적하면
-    #   그 방향에서 봤을 때의 1D 좌표(scalar)가 나온다.
-    #   max - min = 그 방향에서 본 물체의 너비
-    #
-    # 예)
-    #   closing_direction = [1, 0, 0]  (X방향으로 손가락이 닫힘)
-    #   물체 점들의 X좌표 범위: 0.50 ~ 0.65m
-    #   required_width = 0.65 - 0.50 = 0.15m (150mm)
-    # ──────────────────────────────────────────────────────────────
 
     def calculate_required_width(
         self,
@@ -276,102 +330,42 @@ class GraspValidatorNode(Node):
         closing_direction: np.ndarray,
     ) -> float:
         d = np.array(closing_direction, dtype=float)
-        d /= (np.linalg.norm(d) + 1e-9)  # 단위벡터로 정규화 (크기=1로 만들기)
-
-        # @ 연산자 = 행렬 곱. shape (N,3) @ (3,) = shape (N,) → 각 점의 투영값
+        d /= (np.linalg.norm(d) + 1e-9)
         proj = target_points @ d
-
-        return float(proj.max() - proj.min())  # 최대 - 최소 = 필요 개폐폭
-
-    # ──────────────────────────────────────────────────────────────
-    # [함수 3] transform_to_gripper_frame  ← 신규 구현
-    #
-    # world 좌표계 점군 → 그리퍼 로컬 좌표계로 변환
-    #
-    # 왜 변환이 필요한가?
-    #   충돌 박스(손가락, 본체)는 그리퍼 로컬 좌표계에서 정의되어 있음.
-    #   환경 점군은 world(base_link) 좌표계에 있음.
-    #   같은 좌표계로 맞춰야 "박스 안에 점이 있는지" 계산 가능.
-    #
-    # 수식: local = (point - tcp_pos) @ rotation
-    #   (point - tcp_pos): TCP를 원점으로 이동
-    #   @ rotation: world → local 회전 변환
-    #   (rotation의 열벡터가 로컬 축의 world 방향이므로,
-    #    @ 연산이 자동으로 R^T(전치) 효과 = world→local 방향)
-    # ──────────────────────────────────────────────────────────────
+        return float(proj.max() - proj.min())
 
     def transform_to_gripper_frame(
         self,
-        points: np.ndarray,    # (N,3) world 좌표계 점군
-        position: np.ndarray,  # (3,)  TCP 위치 (world 좌표계)
-        rotation: np.ndarray,  # (3,3) 그리퍼 회전행렬 (열=로컬 축 방향)
+        points: np.ndarray,
+        position: np.ndarray,
+        rotation: np.ndarray,
     ) -> np.ndarray:
-        return (points - position) @ rotation  # 평행이동 후 회전 변환
-
-    # ──────────────────────────────────────────────────────────────
-    # [함수 4] count_points_in_box  ← 신규 구현
-    #
-    # axis-aligned box(축 정렬 박스) 안에 있는 점 개수 반환.
-    # 충돌 검사에서 "이 공간에 환경 점이 몇 개 있나?" 확인에 사용.
-    #
-    # 구현 설명:
-    #   (points >= box_min) → shape(N,3), 각 좌표가 최솟값 이상인지 True/False
-    #   (points <= box_max) → shape(N,3), 각 좌표가 최댓값 이하인지 True/False
-    #   & 로 AND 처리 → 두 조건 모두 만족
-    #   .all(axis=1) → 행 방향(x,y,z 모두)이 True인 점만 선택 → shape(N,)
-    #   .sum() → True 개수 = 박스 안의 점 개수
-    # ──────────────────────────────────────────────────────────────
+        return (points - position) @ rotation
 
     def count_points_in_box(
         self,
-        points: np.ndarray,   # (N,3) 검사할 점군 (그리퍼 로컬 좌표계)
-        box_min: np.ndarray,  # (3,)  박스 최솟값 [x_min, y_min, z_min]
-        box_max: np.ndarray,  # (3,)  박스 최댓값 [x_max, y_max, z_max]
+        points: np.ndarray,
+        box_min: np.ndarray,
+        box_max: np.ndarray,
     ) -> int:
         if len(points) == 0:
             return 0
-        # x, y, z 모두 박스 범위 안인 점만 True
         mask = np.all((points >= box_min) & (points <= box_max), axis=1)
         return int(mask.sum())
 
-    # ──────────────────────────────────────────────────────────────
-    # [함수 5] check_gripper_clearance  ← 신규 구현
-    #
-    # 그리퍼를 grasp pose에 배치했을 때 환경 점군과 충돌하는지 검사.
-    # 그리퍼 형상을 3개의 박스로 근사:
-    #
-    #  [TCP 로컬 좌표 기준 그리퍼 형상]
-    #
-    #  z=+0.132 ┌──────────────┐  ← 본체(body)
-    #           │              │     x: -0.018 ~ +0.018
-    #  z= 0.000 └──────────────┘  ← TCP (원점)
-    #
-    #  z=-0.000 ┌──┐       ┌──┐  ← 손가락 L(왼쪽) / R(오른쪽)
-    #           │L │       │R │     x: -0.006 ~ +0.006
-    #  z=-0.055 └──┘       └──┘     y(L): +half_w ~ +half_w+0.020
-    #                               y(R): -half_w-0.020 ~ -half_w
-    #            ← half_w →← half_w →
-    #              (물체 폭 절반)
-    #
-    # 각 박스에 환경 점이 COLLISION_THRESHOLD(5)개 이상 → 충돌 판정
-    # ──────────────────────────────────────────────────────────────
-
     def check_gripper_clearance(
         self,
-        environment_points: np.ndarray,  # (M,3) 환경 점군 (world 좌표계)
-        candidate: dict,                  # 파지 후보 (position, rotation 포함)
-        required_width: float,            # 그리퍼 필요 개폐폭 (m)
+        environment_points: np.ndarray,
+        candidate: dict,
+        required_width: float,
     ) -> tuple:
-        position = np.array(candidate["position"])  # TCP 위치 (world)
-        rotation = np.array(candidate["rotation"])  # 그리퍼 회전행렬
-        half_w   = required_width / 2.0             # 물체 폭의 절반
+        position = np.array(candidate["position"])
+        rotation = np.array(candidate["rotation"])
+        half_w   = required_width / 2.0
 
-        # 환경 점군을 그리퍼 로컬 좌표계로 변환 → 박스와 같은 좌표계
         local_env = self.transform_to_gripper_frame(
             environment_points, position, rotation)
 
-        # ── 왼쪽 손가락 박스 (y 양수 방향) ─────────────────────────
-        # y 범위: 물체 폭 절반(half_w)에서 손가락 폭(FINGER_WIDTH)만큼 더 바깥
         l_n = self.count_points_in_box(
             local_env,
             np.array([-FINGER_THICKNESS/2,  half_w,                -FINGER_LENGTH]),
@@ -380,7 +374,6 @@ class GraspValidatorNode(Node):
         if l_n > COLLISION_THRESHOLD:
             return False, f"LEFT_FINGER_BLOCKED({l_n}pts)"
 
-        # ── 오른쪽 손가락 박스 (y 음수 방향) ────────────────────────
         r_n = self.count_points_in_box(
             local_env,
             np.array([-FINGER_THICKNESS/2, -(half_w + FINGER_WIDTH), -FINGER_LENGTH]),
@@ -389,7 +382,6 @@ class GraspValidatorNode(Node):
         if r_n > COLLISION_THRESHOLD:
             return False, f"RIGHT_FINGER_BLOCKED({r_n}pts)"
 
-        # ── 본체 박스 (TCP 뒤쪽, z 양수 방향) ───────────────────────
         b_n = self.count_points_in_box(
             local_env,
             np.array([-BODY_SIZE_X/2, -BODY_SIZE_Y/2, 0.0]),
@@ -400,23 +392,6 @@ class GraspValidatorNode(Node):
 
         return True, "CLEAR"
 
-    # ──────────────────────────────────────────────────────────────
-    # [함수 6] check_approach_path  ← 신규 구현
-    #
-    # pre-grasp 위치 → grasp 위치까지 이동 경로 상의 충돌 검사.
-    #
-    # 방법: 경로를 APPROACH_STEP(10mm) 간격으로 샘플링해서
-    #       각 위치에서 손가락 박스와 환경 점군을 비교.
-    #
-    # t=0.0: pre-grasp (grasp에서 approach 반대로 100mm 물러난 위치)
-    # t=1.0: grasp 위치
-    #
-    # 예) FRONT 파지, approach=[0,-1,0]:
-    #   pre_pos = grasp_pos - [0,-1,0]*0.1 = grasp_pos + [0,0.1,0]
-    #   → 선반 앞 10cm에서 시작해서 물체 쪽으로 접근
-    #   t=0.0: 10cm 앞, t=0.5: 5cm 앞, t=1.0: 물체 위치
-    # ──────────────────────────────────────────────────────────────
-
     def check_approach_path(
         self,
         environment_points: np.ndarray,
@@ -425,26 +400,20 @@ class GraspValidatorNode(Node):
     ) -> tuple:
         position     = np.array(candidate["position"])
         approach_dir = np.array(candidate["approach_direction"])
-        approach_dir /= (np.linalg.norm(approach_dir) + 1e-9)  # 단위벡터
+        approach_dir /= (np.linalg.norm(approach_dir) + 1e-9)
 
-        # pre-grasp 위치: grasp에서 approach 반대 방향으로 PREGRASP_DISTANCE
-        pre_pos = position + approach_dir * PREGRASP_DISTANCE
+        pre_pos = position - approach_dir * PREGRASP_DISTANCE
 
-        n_steps  = max(2, int(PREGRASP_DISTANCE / APPROACH_STEP))  # 검사 횟수
+        n_steps  = max(2, int(PREGRASP_DISTANCE / APPROACH_STEP))
         rotation = np.array(candidate["rotation"])
         half_w   = required_width / 2.0
 
         for i in range(n_steps + 1):
-            t = i / n_steps  # 0.0 ~ 1.0
-
-            # 선형 보간: t=0이면 pre_pos, t=1이면 position
+            t = i / n_steps
             current_pos = pre_pos + (position - pre_pos) * t
-
-            # 현재 그리퍼 위치에서 로컬 좌표 변환
             local_env = self.transform_to_gripper_frame(
                 environment_points, current_pos, rotation)
 
-            # 왼쪽 손가락 충돌 검사
             l_n = self.count_points_in_box(
                 local_env,
                 np.array([-FINGER_THICKNESS/2,  half_w,                -FINGER_LENGTH]),
@@ -453,7 +422,6 @@ class GraspValidatorNode(Node):
             if l_n > COLLISION_THRESHOLD:
                 return False, f"APPROACH_L_BLOCKED(t={t:.2f},{l_n}pts)"
 
-            # 오른쪽 손가락 충돌 검사
             r_n = self.count_points_in_box(
                 local_env,
                 np.array([-FINGER_THICKNESS/2, -(half_w + FINGER_WIDTH), -FINGER_LENGTH]),
@@ -464,54 +432,27 @@ class GraspValidatorNode(Node):
 
         return True, "PATH_CLEAR"
 
-    # ──────────────────────────────────────────────────────────────
-    # [함수 7] compute_obb  ← 신규 구현 (PCA 기반 OBB 계산)
-    #
-    # OBB = Oriented Bounding Box (물체 방향에 맞게 회전된 최소 경계 박스)
-    # AABB(축 정렬)와 달리 물체가 기울어져 있어도 꼭 맞게 계산됨.
-    #
-    # PCA(주성분 분석) 원리:
-    #   점들이 가장 많이 퍼진 방향 → 주성분 1 = long_axis (분산 최대)
-    #   그 다음으로 퍼진 방향     → 주성분 2 = mid_axis
-    #   제일 안 퍼진 방향         → 주성분 3 = short_axis (분산 최소)
-    #
-    # 계산 순서:
-    #   1. 중심(center) 계산 → 원점으로 이동(shifted)
-    #   2. 공분산 행렬(3x3) 계산 → 각 방향의 분산 크기와 방향 담김
-    #   3. 고유값 분해 → 고유벡터 = 주성분 방향, 고유값 = 분산 크기
-    #   4. 고유값 내림차순 정렬 → long > mid > short
-    #   5. 각 축 방향으로 투영해서 크기(size) 계산
-    # ──────────────────────────────────────────────────────────────
-
     def compute_obb(self, points: np.ndarray) -> dict:
-        center  = points.mean(axis=0)   # 점군의 무게중심
-        shifted = points - center        # 중심을 원점으로 이동
+        center  = points.mean(axis=0)
+        shifted = points - center
 
-        # 공분산 행렬: 각 방향으로 점들이 얼마나 퍼져있는지 나타냄 (3x3)
         cov = np.cov(shifted.T)
-
-        # 고유값(eigvals) = 각 방향의 분산 크기
-        # 고유벡터(eigvecs) = 각 방향의 단위벡터 (열벡터)
         eigvals, eigvecs = np.linalg.eigh(cov)
 
-        # 고유값 내림차순 정렬 → 분산 큰 순서 = long, mid, short
         order   = np.argsort(eigvals)[::-1]
         eigvecs = eigvecs[:, order]
 
-        long_axis  = eigvecs[:, 0].copy()  # 제일 긴 방향 (분산 최대)
-        mid_axis   = eigvecs[:, 1].copy()  # 중간 방향
-        short_axis = eigvecs[:, 2].copy()  # 제일 짧은 방향 (분산 최소)
+        long_axis  = eigvecs[:, 0].copy()
+        mid_axis   = eigvecs[:, 1].copy()
+        short_axis = eigvecs[:, 2].copy()
 
-        # 부호 통일: z성분이 음수면 반전
-        # → 같은 물체라도 호출할 때마다 부호가 바뀌면 closing 방향이 바뀌어 불안정
         for ax in (long_axis, mid_axis, short_axis):
             if ax[2] < 0:
                 ax *= -1
 
-        # 각 축 방향 크기 계산 (투영 후 max-min)
         def _size(ax):
-            p = shifted @ ax          # 각 점을 해당 축에 투영
-            return float(p.max() - p.min())  # 그 방향의 물체 크기
+            p = shifted @ ax
+            return float(p.max() - p.min())
 
         return {
             "center"     : center,
@@ -521,131 +462,62 @@ class GraspValidatorNode(Node):
             "size_long"  : _size(long_axis),
             "size_mid"   : _size(mid_axis),
             "size_short" : _size(short_axis),
-            "top_z"      : float(points[:, 2].max()),    # 물체 최상단 z
-            "bottom_z"   : float(points[:, 2].min()),    # 물체 최하단 z
+            "top_z"      : float(points[:, 2].max()),
+            "bottom_z"   : float(points[:, 2].min()),
         }
-
-    # ──────────────────────────────────────────────────────────────
-    # [함수 8] make_rotation_matrix  ← 신규 구현
-    #
-    # approach와 closing 방향으로 그리퍼의 3x3 회전행렬 생성.
-    #
-    # [★ 수정 포인트: Z축 = -approach]
-    # 이전 코드: z = +approach_direction  → 잘못됨
-    # 수정 후:  z = -approach_direction  → 올바름
-    #
-    # 이유:
-    #   approach = [0,-1,0]: 그리퍼가 Y 음방향으로 이동 (선반 안으로)
-    #   그러면 그리퍼 손끝은 Y 양방향을 바라봄 (물체 쪽)
-    #   로컬 +Z(본체 방향)는 손끝 반대 = Y 양방향 = -approach
-    #
-    # 로컬 좌표계:
-    #   +Z = 본체 방향 = -approach   (마운트 쪽)
-    #   +Y = closing_direction        (손가락 닫히는 방향)
-    #   +X = Y × Z                   (오른손 법칙으로 자동 결정)
-    # ──────────────────────────────────────────────────────────────
 
     def make_rotation_matrix(
         self,
-        approach_direction: np.ndarray,  # 그리퍼 이동 방향 (world 좌표계)
-        closing_direction: np.ndarray,   # 손가락 닫히는 방향 (world 좌표계)
+        approach_direction: np.ndarray,
+        closing_direction: np.ndarray,
     ) -> np.ndarray:
-        # ★ 수정: z = -approach (본체 방향 = 그리퍼 진입 반대)
-        z = np.array(approach_direction, dtype=float)
-        z /= (np.linalg.norm(z) + 1e-9)  # 단위벡터 정규화
+        z = -np.array(approach_direction, dtype=float)
+        z /= (np.linalg.norm(z) + 1e-9)
 
         y = np.array(closing_direction, dtype=float)
-        # y를 z에 수직이 되도록 정사영 (그람-슈미트)
-        # 완전히 수직이 아닐 경우를 대비해 z성분 제거
         y -= y.dot(z) * z
         y /= (np.linalg.norm(y) + 1e-9)
 
-        x = np.cross(y, z)  # 오른손 법칙: y와 z에 모두 수직인 방향
+        x = np.cross(y, z)
         x /= (np.linalg.norm(x) + 1e-9)
 
-        # 열벡터로 쌓기: 각 열이 로컬 x,y,z 축의 world 방향
-        return np.column_stack([x, y, z])  # shape: (3,3)
-
-    # ──────────────────────────────────────────────────────────────
-    # [함수 9] _rotation_to_dsr_euler
-    #
-    # 3x3 회전행렬 → DSR posx에 넣을 오일러각 (a, b, c, deg)
-    #
-    # 두산 DSR은 ZYZ 오일러각 표현 사용.
-    # ※ 실제 동작 확인 후 ZYX이면 이 함수만 수정하면 됨
-    #
-    # ZYZ 변환 공식 (b=0 또는 π 특이점 처리 포함):
-    #   b = atan2(√(R[2,0]²+R[2,1]²), R[2,2])
-    #   a = atan2(R[1,2], R[0,2])      (b≠0 일 때)
-    #   c = atan2(R[2,1], -R[2,0])     (b≠0 일 때)
-    # ──────────────────────────────────────────────────────────────
+        return np.column_stack([x, y, z])
 
     def _rotation_to_dsr_euler(self, R: np.ndarray) -> tuple:
         b = math.atan2(math.sqrt(R[2,0]**2 + R[2,1]**2), R[2,2])
 
         if abs(math.sin(b)) > 1e-6:
-            # 일반적인 경우 (b가 0 또는 π가 아닐 때)
             a = math.atan2(R[1,2],  R[0,2])
             c = math.atan2(R[2,1], -R[2,0])
         else:
-            # 특이점: b ≈ 0 또는 π일 때 a와 c가 얽혀 개별 결정 불가
-            # a-c 또는 a+c 합만 결정 가능 → a에 몰아넣고 c=0
             a = math.atan2(-R[1,0], R[0,0])
             c = 0.0
 
         return math.degrees(a), math.degrees(b), math.degrees(c)
 
-    # ──────────────────────────────────────────────────────────────
-    # [함수 10] create_top_candidate  ← 신규 구현 + ★수정
-    #
-    # 위에서 수직으로 내려오는 파지 후보 생성.
-    #
-    # [★ 수정1: closing = short_axis_xy (이전: long_axis_xy)]
-    #
-    #   위에서 본 물체:
-    #     long_axis →  ┌──────────────────┐
-    #                  │    물체           │  ↕ short_axis (예: 80mm)
-    #                  └──────────────────┘
-    #                  ←    200mm         →
-    #
-    #   closing = long_axis → 그리퍼 200mm 필요 → 한계(100mm) 초과 → 실패
-    #   closing = short_axis → 그리퍼 80mm 필요 → 파지 가능 ✓
-    #   → 파지 성공 가능성을 높이려면 항상 짧은 방향으로 손가락을 닫아야 함
-    #
-    # [★ 수정2: grasp z = top_z (이전: center_z)]
-    #   center_z 사용 시: 손가락이 물체 중간 높이로 접근
-    #   → 위에서 내려오다가 선반 천장에 그리퍼 본체가 충돌할 위험
-    #   top_z 사용 시: 물체 맨 위에서 살짝 누르듯 잡음 → 안전
-    # ──────────────────────────────────────────────────────────────
-
-    def create_top_candidate(self) -> dict | None:
+    def create_top_candidate(self) -> dict:
         if self.target_points is None or len(self.target_points) < 10:
             return None
 
         obb = self.compute_obb(self.target_points)
 
-        approach = np.array([0.0, 0.0, -1.0])  # Z 음방향 (위→아래)
+        approach = np.array([0.0, 0.0, -1.0])
 
-        # ★ short_axis를 XY 평면에 투영 → 가장 짧은 수평 방향
-        #   z성분 제거: 위에서 잡을 때 손가락은 수평으로 닫히므로 수직 성분 불필요
         sx   = obb["short_axis"].copy()
-        sx[2] = 0.0  # z성분 제거
+        sx[2] = 0.0
         norm = np.linalg.norm(sx)
 
         if norm < 1e-6:
-            # short_axis가 거의 수직인 경우 (예: 세워진 원통)
-            # → 수평 방향 정보가 없으므로 long_axis로 대체
             sx   = obb["long_axis"].copy()
             sx[2] = 0.0
             norm = np.linalg.norm(sx)
             sx   = np.array([1.0, 0.0, 0.0]) if norm < 1e-6 else sx / norm
         else:
-            sx /= norm  # 단위벡터로 정규화
+            sx /= norm
 
         closing  = sx
         rotation = self.make_rotation_matrix(approach, closing)
 
-        # ★ grasp 위치: xy=물체 중심, z=물체 최상단(top_z)
         position = np.array([obb["center"][0], obb["center"][1], obb["top_z"]])
 
         a, b, c = self._rotation_to_dsr_euler(rotation)
@@ -659,96 +531,32 @@ class GraspValidatorNode(Node):
                 position[0]*1000, position[1]*1000, position[2]*1000,
                 a, b, c
             ],
-            "obb": obb,  # 디버깅/로그용으로 포함
+            "obb": obb,
         }
 
-    # ──────────────────────────────────────────────────────────────
-    # [함수 11] create_front_candidate  ← 신규 구현 + ★수정
-    #
-    # 선반 앞(Y 음방향)에서 수평으로 접근하는 파지 후보 생성.
-    #
-    # [★ 수정: OBB 사용해서 closing 방향 자동 선택 (이전: 고정 [1,0,0])]
-    #
-    #   이전 코드: closing = [1,0,0] 항상 고정
-    #   → 물체가 45도 기울어지면 실제 물체 폭보다 더 넓게 벌어야 함 → 실패
-    #
-    #   수정 후: approach와 수직인 OBB 축을 자동 선택
-    #   → 물체가 어느 방향으로 기울어져 있어도 실제 짧은 방향으로 잡음
-    #
-    #   선택 원칙:
-    #     short → mid → long 순으로 시도
-    #     approach 방향([0,-1,0])과 내적이 0.8 미만이면 채택 (충분히 수직)
-    #
-    #     왜 approach와 수직이어야 하나?
-    #       closing이 approach와 평행하면 손가락이 그리퍼 진입 방향으로 닫힘
-    #       → 물체를 옆에서 잡는 게 아니라 앞뒤로 눌러버리는 꼴 → 물리적으로 이상
-    #
-    # [grasp z: center_z 사용]
-    #   물체 중심 높이에서 접근
-    # ──────────────────────────────────────────────────────────────
-
-    def create_front_candidate(
-        self,
-        approach: np.ndarray | None = None,
-    ) -> dict | None:
-        """
-        ★ 재설계: approach를 수평(Y축)으로 제한하던 가정을 제거했다.
-
-        이전에는 "선반과의 충돌을 피하려면 정면에서 수평으로만 접근해야
-        한다"고 가정하고 approach=[0,-1,0]으로 고정했었다. 하지만 실제로는:
-
-          1) check_gripper_clearance/check_approach_path가 이미 그리퍼
-             손가락/본체 박스를 environment_points(점군)와 대조해서
-             접근 경로 전체의 충돌을 검사하고 있고,
-          2) cobot2_mi_node의 MoveIt 경로계획도 선반을 포함한 전체
-             환경(planning scene)과의 충돌을 별도로 검사한다.
-
-        즉 충돌 안전성은 이미 이 두 단계에서 보장되므로, approach 방향을
-        수평으로 강제할 이유가 없다. 오히려 그 제약 때문에 실제로는
-        도달 가능한 위치인데도 관절 한계를 넘는 자세만 계산되어 파지에
-        실패하는 문제가 있었다.
-
-        이제 approach는 임의의 3D 방향(대각선, 위/아래 성분 포함)을
-        받을 수 있고, select_grasp()가 여러 방향을 순서대로 시도한다.
-        """
+    def create_front_candidate(self) -> dict:
         if self.target_points is None or len(self.target_points) < 10:
             return None
 
         obb = self.compute_obb(self.target_points)
 
-        if approach is None:
-            approach = np.array([0.0, -1.0, 0.0])  # 기본값 (수평, 하위 호환용)
-        approach = np.asarray(approach, dtype=float)
-        approach = approach / (np.linalg.norm(approach) + 1e-9)
+        approach = np.array([0.0, -1.0, 0.0])
 
-        # fallback closing을 approach에 항상 수직이 되도록 동적으로 계산
-        world_ref = np.array([0.0, 0.0, 1.0])
-        if abs(np.dot(approach, world_ref)) > 0.9:
-            world_ref = np.array([1.0, 0.0, 0.0])
-        fallback_closing = np.cross(approach, world_ref)
-        fallback_closing /= (np.linalg.norm(fallback_closing) + 1e-9)
-
-        # ★ 수정: approach와 수직인 OBB 축 자동 선택.
-        # 이전에는 "ax[2] = 0.0"으로 항상 z성분을 강제로 제거해서
-        # closing 방향도 수평으로만 고정되어 있었다. approach가 이제
-        # 대각선/수직 방향도 될 수 있으므로, closing도 3차원 그대로
-        # 사용해서 approach와의 수직 관계만 확인한다.
-        closing = fallback_closing  # 모든 축이 평행한 극단적 경우의 대비값
+        closing = np.array([1.0, 0.0, 0.0])
         for key in ("short_axis", "mid_axis", "long_axis"):
-            ax = obb[key].copy()
+            ax   = obb[key].copy()
+            ax[2] = 0.0
             norm = np.linalg.norm(ax)
             if norm < 1e-6:
                 continue
             ax /= norm
 
-            # approach 방향과의 내적 절대값 < 0.8이면 "충분히 수직" → 채택
             if abs(ax.dot(approach)) < 0.8:
                 closing = ax
-                break  # 첫 번째로 조건을 만족하는 축 사용
+                break
 
         rotation = self.make_rotation_matrix(approach, closing)
 
-        # grasp 위치: 물체 중심 그대로 사용
         position = obb["center"].copy()
 
         a, b, c = self._rotation_to_dsr_euler(rotation)
@@ -762,20 +570,8 @@ class GraspValidatorNode(Node):
                 position[0]*1000, position[1]*1000, position[2]*1000,
                 a, b, c
             ],
-            "obb": obb,  # 디버깅/로그용으로 포함
+            "obb": obb,
         }
-
-    # ──────────────────────────────────────────────────────────────
-    # [함수 12] check_doosan_ik  (기존 코드 유지)
-    #
-    # DSR ikin() 함수로 IK(역기구학) 검사.
-    # pose_mm_deg = [x_mm, y_mm, z_mm, a_deg, b_deg, c_deg]
-    #
-    # ikin() 반환 상태:
-    #   status=0 → IK 성공, joint_solution(관절 6개 각도, deg) 반환
-    #   status=1 → 작업영역 밖 (팔이 닿지 않는 위치)
-    #   status=2 → 손목 특이점 (wrist singularity, 수학적으로 해가 무한)
-    # ──────────────────────────────────────────────────────────────
 
     def check_doosan_ik(self, candidate: dict) -> tuple:
         pose = candidate.get("pose_mm_deg")
@@ -827,37 +623,18 @@ class GraspValidatorNode(Node):
                     continue
 
                 self.get_logger().info(
-                    f"IK 계산 성공(sol={sol_space}): "
-                    + ", ".join(f"{v:.2f}" for v in joints)
-                )
-
-                # ★ 추가: MoveIt과 동일한 관절 제한 검사
-                # 한계 근처의 해는 버리고 다음 solution space를 계속 탐색한다.
-                # 이렇게 걸러진 해만 채택하면 Cartesian 직선 보간 중
-                # 중간 지점에서 관절 한계를 넘어 IK가 끊기는 문제가 줄어든다.
-                limits_ok, limit_reason = self.check_joint_limits(joints)
-
-                if not limits_ok:
-                    self.get_logger().warn(
-                        f"IK 해 제외(sol={sol_space}) | "
-                        f"관절 제한 위반: {limit_reason}"
-                    )
-                    continue
-
-                self.get_logger().info(
-                    f"IK 최종 채택(sol={sol_space}): "
+                    f"IK 성공(sol={sol_space}): "
                     + ", ".join(f"{v:.2f}" for v in joints)
                 )
 
                 return True, joints, "OK"
 
-            return False, None, "IK_NO_SOLUTION_WITHIN_JOINT_LIMITS"
+            return False, None, "IK_NO_SOLUTION"
 
         except Exception as e:
             return False, None, f"IK_EXCEPTION:{e}"
 
     def check_current_robot_state(self):
-        """노드 시작 시 두산 API 연결 확인용 — 성공하면 현재 자세 로그 출력"""
         try:
             posj = self.dsr_get_current_posj()
             posx, sol = self.dsr_get_current_posx(ref=self.DR_BASE)
@@ -871,115 +648,28 @@ class GraspValidatorNode(Node):
             self.get_logger().error(f"로봇 상태 조회 실패: {e}")
             return False
 
-    # ★ 추가: 관절 한계 검사 함수
-    def check_joint_limits(self, joints: list[float]) -> tuple[bool, str]:
-        """
-        MOVEIT_JOINT_LIMITS_DEG 기준으로 각 관절값이 안전 범위 안인지 검사.
-        JOINT_LIMIT_MARGIN_DEG만큼 여유를 두고, 그 여유 안쪽이어야 통과.
-        """
-        if len(joints) != 6:
-            return False, f"JOINT_COUNT_INVALID:{len(joints)}"
-
-        violations = []
-
-        for index, (value, limits) in enumerate(
-            zip(joints, MOVEIT_JOINT_LIMITS_DEG),
-            start=1,
-        ):
-            minimum, maximum = limits
-
-            safe_minimum = minimum + JOINT_LIMIT_MARGIN_DEG
-            safe_maximum = maximum - JOINT_LIMIT_MARGIN_DEG
-
-            if value < safe_minimum or value > safe_maximum:
-                violations.append(
-                    f"J{index}={value:.2f}deg "
-                    f"allowed=[{safe_minimum:.2f},{safe_maximum:.2f}]"
-                )
-
-        if violations:
-            return False, "; ".join(violations)
-
-        return True, "JOINT_LIMITS_OK"
-
-    # ──────────────────────────────────────────────────────────────
-    # 검증 파이프라인 (기존 로직 유지, layer 분기 추가)
-    # ──────────────────────────────────────────────────────────────
-
     def validate_candidate(self, candidate, target_pts, env_pts) -> dict:
-        """
-        단일 파지 후보 검증 — 4단계 순차 검사.
-        앞 단계 실패 시 즉시 반환 (이후 단계 스킵 → 효율적).
-        """
-        # 1단계: 물체 폭이 그리퍼 최대폭 안에 들어오는지
         w = self.calculate_required_width(target_pts, candidate["closing_direction"])
         if w + GRIPPER_MARGIN > GRIPPER_MAX_OPENING:
             return {"success": False, "reason": "WIDTH_TOO_LARGE", "required_width": w}
 
-        # 2단계: grasp 위치에서 손가락/본체 공간에 장애물 없는지
         ok, reason = self.check_gripper_clearance(env_pts, candidate, w)
         if not ok:
             return {"success": False, "reason": reason, "required_width": w}
 
-        # 3단계: pre-grasp → grasp 접근 경로에 장애물 없는지
         ok, reason = self.check_approach_path(env_pts, candidate, w)
         if not ok:
             return {"success": False, "reason": reason, "required_width": w}
 
-        # 4단계: 두산 IK — 실제로 이 pose에 팔이 도달 가능한지
         ik_ok, joints, ik_reason = self.check_doosan_ik(candidate)
         if not ik_ok:
             return {"success": False, "reason": ik_reason, "required_width": w}
 
         return {"success": True, "reason": "OK", "required_width": w, "joints": joints}
 
-    # ★ 재설계: approach 방향을 더 이상 수평으로 제한하지 않는다.
-    #
-    # 충돌 안전성은 이미 두 단계에서 보장된다:
-    #   1) validate_candidate() 안의 check_gripper_clearance/
-    #      check_approach_path — 그리퍼 손가락/본체 박스를 environment
-    #      점군과 대조해서 이 candidate의 접근 경로 충돌을 검사
-    #   2) cobot2_mi_node의 MoveIt 경로계획 — 선반을 포함한 전체
-    #      planning scene과의 충돌을 별도로 검사
-    #
-    # 따라서 approach를 "정면에서 수평으로만"으로 제한할 이유가 없고,
-    # 오히려 그 제약 때문에 실제로는 도달 가능한 자세인데도 관절
-    # 한계를 넘는 orientation만 계산되어 파지에 실패하는 문제가 있었다.
-    #
-    # 아래는 방위각(azimuth, xy평면 회전) 8방향 × 고도각(elevation,
-    # 위/아래 기울기) 2단계로 만든 approach 후보들이다. 정면뿐 아니라
-    # 대각선/비스듬히 위에서 내려오는 방향까지 폭넓게 시도해서, 8개
-    # solution space 중 관절 한계 안쪽인 해를 찾을 확률을 높인다.
-    def _build_front_approach_candidates(self) -> list:
-        candidates = []
-        for az_deg in (135, 180, 225, 315):
-            for el_deg in (0, -30):  # 0=수평, -30=비스듬히 위에서 내려오는 방향
-                az = math.radians(az_deg)
-                el = math.radians(el_deg)
-                dx = math.cos(az) * math.cos(el)
-                dy = math.sin(az) * math.cos(el)
-                dz = math.sin(el)
-                candidates.append(np.array([dx, dy, dz]))
-        return candidates
-
-    def select_grasp(self, top_cand, target_pts, env_pts) -> dict:
-        """
-        층(layer) 판단 후 파지 전략 결정.
-
-        bottom: FRONT만 시도
-            → 하부 선반은 TOP 접근 공간 부족 (0.235m < 0.243m)
-
-        top: TOP 먼저 시도 → 실패 시 FRONT → 둘 다 실패 시 NONE
-            → 공간이 충분할 경우에만 TOP 시도
-
-        ★ 재설계: FRONT는 이제 방위각 8방향 × 고도각 2단계(총 16개)
-        approach 후보를 순서대로 시도한다. 충돌 안전성은 point cloud
-        기반 그리퍼 박스 검사와 MoveIt 경로계획이 각자 보장하므로,
-        approach 방향 자체를 수평으로 강제할 필요가 없다.
-        """
+    def select_grasp(self, top_cand, front_cand, target_pts, env_pts) -> dict:
         layer = self.object_layer or 'bottom'
 
-        # TOP 시도 조건: 상부 선반(top) AND 공간 충분
         if layer == 'top' and SHELF_USABLE_HEIGHT > REQUIRED_TOP_SPACE:
             r = self.validate_candidate(top_cand, target_pts, env_pts)
             if r["success"]:
@@ -987,30 +677,15 @@ class GraspValidatorNode(Node):
                         "candidate": top_cand, "validation": r}
             self.get_logger().warn(f"TOP 실패: {r['reason']} → FRONT 시도")
 
-        # ── FRONT: 여러 approach 방향을 순서대로 시도 ──────────────────
-        last_reason = "NO_CANDIDATE"
-        for approach in self._build_front_approach_candidates():
-            front_cand = self.create_front_candidate(approach)
-            if front_cand is None:
-                continue
+        r = self.validate_candidate(front_cand, target_pts, env_pts)
+        if r["success"]:
+            return {"success": True, "grasp_type": "FRONT",
+                    "candidate": front_cand, "validation": r}
 
-            r = self.validate_candidate(front_cand, target_pts, env_pts)
-            if r["success"]:
-                self.get_logger().info(
-                    f"FRONT 성공 | approach={approach.round(2).tolist()}")
-                return {"success": True, "grasp_type": "FRONT",
-                        "candidate": front_cand, "validation": r}
-
-            self.get_logger().warn(
-                f"FRONT 실패(approach={approach.round(2).tolist()}): "
-                f"{r['reason']} → 다음 방향 시도")
-            last_reason = r['reason']
-
-        self.get_logger().warn(f"FRONT 전체 방향 실패: {last_reason} → NONE")
+        self.get_logger().warn(f"FRONT 실패: {r['reason']} → NONE")
         return {"success": False, "grasp_type": "NONE", "reason": "UNGRASPABLE"}
 
     def rotation_matrix_to_quaternion(self, rotation: np.ndarray) -> tuple:
-        """3x3 회전행렬을 ROS quaternion (x, y, z, w)으로 변환."""
         r = np.asarray(rotation, dtype=np.float64)
         if r.shape != (3, 3):
             raise ValueError("rotation은 3x3 행렬이어야 합니다.")
@@ -1055,7 +730,6 @@ class GraspValidatorNode(Node):
         rotation: np.ndarray,
         stamp,
     ) -> PoseStamped:
-        """base_link 기준 position/rotation을 PoseStamped로 변환."""
         position = np.asarray(position, dtype=np.float64)
         if position.shape != (3,):
             raise ValueError("position은 길이 3인 벡터여야 합니다.")
@@ -1075,17 +749,6 @@ class GraspValidatorNode(Node):
         return pose
 
     def publish_validated_grasp(self, result: dict):
-        """
-        성공한 후보 하나를 ValidatedGrasp 메시지로 발행.
-
-        ★ 수정: pre_grasp_pose도 DSR ikin으로 IK 검증 후 관절값을 함께 발행.
-        이전에는 grasp_pose만 검증했는데, MoveIt(cobot2_mi_node)이
-        pre_grasp_pose로 먼저 경로계획을 시도하면서 MoveIt 자체 IK
-        솔버(KDL, 수치해석 방식)가 실패하는 문제가 있었음.
-        DSR ikin(해석적 solver)으로 pre-grasp도 미리 검증해두면
-        cobot2_mi_node가 pose 기반 IK 대신 이미 검증된 관절값으로
-        joint-space 목표를 설정할 수 있어 훨씬 안정적임.
-        """
         candidate = result["candidate"]
         validation = result["validation"]
         joints = validation.get("joints")
@@ -1097,22 +760,20 @@ class GraspValidatorNode(Node):
 
         grasp_position = np.asarray(candidate["position"], dtype=np.float64)
         rotation = np.asarray(candidate["rotation"], dtype=np.float64)
-        # rotation의 세 번째 열은 그리퍼 로컬 +Z축의 base_link 방향
-        gripper_plus_z_world = rotation[:, 2]
+        approach = np.asarray(
+            candidate["approach_direction"], dtype=np.float64)
 
-        # 이 코드의 축 정의에서 손끝 방향은 로컬 -Z
-        gripper_forward_world = -gripper_plus_z_world
-        gripper_forward_world /= (
-            np.linalg.norm(gripper_forward_world) + 1e-9
-        )
+        approach_norm = np.linalg.norm(approach)
+        if approach_norm < 1e-9:
+            self.get_logger().error(
+                "approach_direction이 0 벡터이므로 후보를 발행하지 않습니다.")
+            return
+        approach /= approach_norm
 
-        # 그리퍼가 바라보는 방향과 정확히 반대쪽에 pre-grasp 생성
         pre_grasp_position = (
-            grasp_position
-            - gripper_forward_world * PREGRASP_DISTANCE
+            grasp_position - approach * PREGRASP_DISTANCE
         )
 
-        # ── ★ pre-grasp pose도 DSR ikin으로 IK 검증 ──────────────────
         a, b, c = self._rotation_to_dsr_euler(rotation)
         pre_grasp_candidate = {
             "pose_mm_deg": [
@@ -1140,12 +801,9 @@ class GraspValidatorNode(Node):
             grasp_position, rotation, stamp)
         msg.grasp_joints = [float(v) for v in joints]
         msg.pre_grasp_joints = [float(v) for v in pre_joints]
-        # ★ 추가: 그리퍼가 벌려야 할 폭(m)도 함께 발행.
-        # 이게 없어서 cobot2_move.py에서 grip_w_mm이 정의되지 않은 채
-        # 그리퍼 닫기 명령에 쓰이다가 크래시가 났었음.
-        msg.required_width = float(validation.get("required_width", 0.05))
 
         self.result_pub.publish(msg)
+        self._published_for_current_item = True  # ★ 추가: 이번 물품 끝 — 재발행 방지
         self.get_logger().info(
             f"ValidatedGrasp 발행 | type={msg.grasp_type} | "
             f"pre=({pre_grasp_position[0]:.3f}, "
@@ -1157,15 +815,15 @@ class GraspValidatorNode(Node):
         )
 
     def run_validation(self):
-        """TOP 후보 생성 → FRONT는 select_grasp 내부에서 여러 방향 시도 → 검증 → 발행."""
         top_cand = self.create_top_candidate()
+        front_cand = self.create_front_candidate()
 
-        if top_cand is None:
+        if top_cand is None or front_cand is None:
             self.get_logger().warn("후보 생성 실패: 메시지를 발행하지 않습니다.")
             return
 
         result = self.select_grasp(
-            top_cand,
+            top_cand, front_cand,
             self.target_points, self.environment_points)
 
         if not result.get("success", False):
@@ -1184,19 +842,15 @@ def main(args=None):
     rclpy.init(args=args)
     node = None
     try:
-        # 1) ROS 노드를 먼저 완전히 생성한다.
         node = GraspValidatorNode()
 
-        # 2) 생성된 노드를 DR_init에 등록한다.
-        #    DSR_ROBOT2는 import될 때 이 노드로 서비스 클라이언트를 생성한다.
         DR_init.__dsr__id = ROBOT_ID
         DR_init.__dsr__model = ROBOT_MODEL
         DR_init.__dsr__node = node
 
-        # 3) 반드시 DR_init 설정이 끝난 다음 두산 API를 import한다.
         node._load_doosan_api()
 
-        node.check_current_robot_state()  # 시작 시 두산 API 연결 확인
+        node.check_current_robot_state()
         while rclpy.ok():
             rclpy.spin_once(node, timeout_sec=0.1)
 
@@ -1205,7 +859,7 @@ def main(args=None):
                 node.run_validation()
 
                 node.target_points = None
-                node.environment_points = None                  # 콜백 루프 시작
+                node.environment_points = None
     except KeyboardInterrupt:
         pass
     except Exception as e:

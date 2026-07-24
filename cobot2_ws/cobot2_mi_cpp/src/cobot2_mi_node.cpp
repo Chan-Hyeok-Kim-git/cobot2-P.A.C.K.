@@ -20,15 +20,21 @@
 #include <memory>
 #include <sstream>
 #include <thread>
+#include <chrono>
 #include <cmath>
+#include <algorithm>
+#include <iterator>
 
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/string.hpp"
 #include "cobot2_interfaces/msg/validated_grasp.hpp"
-#include "moveit/move_group_interface/move_group_interface.h"
 #include "moveit_msgs/msg/robot_trajectory.hpp"
+#include "moveit_msgs/msg/collision_object.hpp"
+#include "shape_msgs/msg/solid_primitive.hpp"
+#include "geometry_msgs/msg/pose.hpp"
 
 #include <moveit/move_group_interface/move_group_interface.h>
+#include <moveit/planning_scene_interface/planning_scene_interface.h>
 
 using ValidatedGrasp = cobot2_interfaces::msg::ValidatedGrasp;
 using moveit::planning_interface::MoveGroupInterface;
@@ -40,6 +46,25 @@ constexpr double kPlanningTimeSec = 5.0;
 constexpr double kVelocityScaling = 0.3;
 constexpr double kAccelScaling = 0.3;
 const char* kPlanningGroup = "manipulator";
+const char* kShelfFrame = "base_link";
+
+struct ShelfBox
+{
+  const char * id;
+  double cx;
+  double cy;
+  double cz;
+  double sx;
+  double sy;
+  double sz;
+};
+
+constexpr ShelfBox kShelfBoxes[] = {
+  {"shelf_floor", 0.57, -0.48, 0.00, 1.01, 0.305, 0.01},
+  {"shelf_back",  0.57, -0.48, 0.24, 1.01, 0.305, 0.01},
+  {"shelf_left", -0.04, -0.47, 0.12, 0.50, 0.020, 0.24},
+  {"shelf_right", 0.92, -0.47, 0.12, 0.50, 0.020, 0.24},
+};
 }  // namespace
 
 class Cobot2MiNode : public rclcpp::Node
@@ -67,6 +92,15 @@ public:
       move_group_->setPlanningTime(kPlanningTimeSec);
       move_group_->setMaxVelocityScalingFactor(kVelocityScaling);
       move_group_->setMaxAccelerationScalingFactor(kAccelScaling);
+      move_group_->setStartStateToCurrentState();
+
+      if (!applyShelfCollisionObjects()) {
+        RCLCPP_WARN(
+          get_logger(),
+          "선반 장애물 등록 확인에 실패했습니다. MoveIt 계획은 계속 사용하지만 "
+          "RViz/PlanningScene에서 선반 등록 상태를 확인하십시오.");
+      }
+
       move_group_ready_ = true;
       RCLCPP_INFO(
         get_logger(), "MoveGroupInterface 준비 완료 (end_effector: %s)",
@@ -80,6 +114,73 @@ public:
   }
 
 private:
+  bool applyShelfCollisionObjects()
+  {
+    std::vector<moveit_msgs::msg::CollisionObject> objects;
+    objects.reserve(std::size(kShelfBoxes));
+
+    for (const auto & box : kShelfBoxes) {
+      moveit_msgs::msg::CollisionObject object;
+      object.header.frame_id = kShelfFrame;
+      object.id = box.id;
+      object.operation = moveit_msgs::msg::CollisionObject::ADD;
+
+      shape_msgs::msg::SolidPrimitive primitive;
+      primitive.type = shape_msgs::msg::SolidPrimitive::BOX;
+      primitive.dimensions = {box.sx, box.sy, box.sz};
+
+      geometry_msgs::msg::Pose pose;
+      pose.position.x = box.cx;
+      pose.position.y = box.cy;
+      pose.position.z = box.cz;
+      pose.orientation.x = 0.0;
+      pose.orientation.y = 0.0;
+      pose.orientation.z = 0.0;
+      pose.orientation.w = 1.0;
+
+      object.primitives.push_back(primitive);
+      object.primitive_poses.push_back(pose);
+      objects.push_back(object);
+    }
+
+    RCLCPP_INFO(
+      get_logger(),
+      "PlanningScene에 선반 장애물 %zu개 등록 요청",
+      objects.size());
+
+    const bool applied = planning_scene_interface_.applyCollisionObjects(objects);
+    if (!applied) {
+      RCLCPP_ERROR(get_logger(), "선반 CollisionObject 등록 요청 실패");
+      return false;
+    }
+
+    // PlanningScene 반영은 비동기일 수 있으므로 짧게 확인한다.
+    const auto deadline = now() + rclcpp::Duration::from_seconds(3.0);
+    while (rclcpp::ok() && now() < deadline) {
+      const auto known = planning_scene_interface_.getKnownObjectNames();
+      bool all_found = true;
+
+      for (const auto & box : kShelfBoxes) {
+        if (std::find(known.begin(), known.end(), std::string(box.id)) == known.end()) {
+          all_found = false;
+          break;
+        }
+      }
+
+      if (all_found) {
+        RCLCPP_INFO(
+          get_logger(),
+          "선반 장애물 등록 완료: shelf_floor, shelf_back, shelf_left, shelf_right");
+        return true;
+      }
+
+      rclcpp::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    RCLCPP_ERROR(get_logger(), "선반 장애물이 PlanningScene에 모두 나타나지 않았습니다.");
+    return false;
+  }
+
   // ── 콜백: ValidatedGrasp 수신 ──────────────────────────────────────
   void onValidatedGrasp(const ValidatedGrasp::SharedPtr msg)
   {
@@ -313,6 +414,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_plan_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_result_;
   std::shared_ptr<MoveGroupInterface> move_group_;
+  moveit::planning_interface::PlanningSceneInterface planning_scene_interface_;
   bool move_group_ready_ {false};
   std::mutex plan_mutex_;
 };
@@ -335,4 +437,4 @@ int main(int argc, char ** argv)
 
   rclcpp::shutdown();
   return 0;
-}
+} 

@@ -28,7 +28,9 @@ setup(
             'cobot2_move = cobot2_control.cobot2_move:main',
             "fake_grasp_cloud_publisher = cobot2_control.fake_grasp_cloud_publisher:main",
             "onrobot = cobot2_control.cobot2_move_modbus:main",
-            "fake_motion_plan_publisher = cobot2_control.fake_motion_plan_publisher:main"
+            "fake_motion_plan_publisher = cobot2_control.fake_motion_plan_publisher:main",
+            "cobot2_task_manager = cobot2_control.cobot2_task_manager:main",
+            
         ],
     },
 )
