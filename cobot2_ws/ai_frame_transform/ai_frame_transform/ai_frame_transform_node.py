@@ -30,9 +30,16 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import rclpy
 from geometry_msgs.msg import TransformStamped
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
 from rclpy.time import Time
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import String
@@ -57,6 +64,9 @@ class AiFrameTransformNode(Node):
         self.declare_parameter("json_output_topic", "/ai/objects_3d/base_json")
         self.declare_parameter("tf_timeout_sec", 0.5)
         self.declare_parameter("fallback_to_latest_tf", False)
+        # 정지 상태 스캔에서는 메시지 시각의 TF를 기다리지 않고
+        # TF 버퍼에 들어온 최신 변환을 즉시 사용한다.
+        self.declare_parameter("use_latest_tf_only", True)
         self.declare_parameter("json_input_scale", 1.0)
         self.declare_parameter(
             "json_camera_position_key", "position_camera_xyz_m"
@@ -69,6 +79,9 @@ class AiFrameTransformNode(Node):
         self.tf_timeout_sec = float(self.get_parameter("tf_timeout_sec").value)
         self.fallback_to_latest_tf = bool(
             self.get_parameter("fallback_to_latest_tf").value
+        )
+        self.use_latest_tf_only = bool(
+            self.get_parameter("use_latest_tf_only").value
         )
         self.json_input_scale = float(self.get_parameter("json_input_scale").value)
         self.json_camera_position_key = str(
@@ -88,20 +101,41 @@ class AiFrameTransformNode(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        # Best-effort subscription is compatible with both best-effort and reliable
-        # sensor publishers. The output JSON remains reliable.
-        sensor_qos = QoSProfile(
+        # PointCloud/JSON 콜백을 TF 구독 콜백과 동시에 처리할 수 있도록
+        # 별도의 reentrant callback group에 둔다.
+        self.processing_callback_group = ReentrantCallbackGroup()
+
+        # Input PointCloud2 topics are sensor streams, so subscribe with
+        # BEST_EFFORT. This can receive from either BEST_EFFORT or RELIABLE
+        # publishers without forcing the camera/perception pipeline to block.
+        cloud_input_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
-            depth=2,
+            depth=5,
         )
+
+        # Downstream processing nodes commonly subscribe with RELIABLE.
+        # A BEST_EFFORT publisher cannot satisfy a RELIABLE subscriber, so the
+        # transformed output clouds must use RELIABLE.
+        cloud_output_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+        )
+
+        # BEST_EFFORT subscription accepts JSON from either reliability mode.
+        # Transformed JSON is an event/result stream, so publish it reliably.
         json_input_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
         )
         json_output_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
         )
@@ -118,10 +152,10 @@ class AiFrameTransformNode(Node):
         json_output = str(self.get_parameter("json_output_topic").value)
 
         self.background_pub = self.create_publisher(
-            PointCloud2, background_output, sensor_qos
+            PointCloud2, background_output, cloud_output_qos
         )
         self.object_pub = self.create_publisher(
-            PointCloud2, object_output, sensor_qos
+            PointCloud2, object_output, cloud_output_qos
         )
         self.json_pub = self.create_publisher(String, json_output, json_output_qos)
 
@@ -131,19 +165,22 @@ class AiFrameTransformNode(Node):
             lambda msg: self._cloud_callback(
                 msg, self.background_pub, "background"
             ),
-            sensor_qos,
+            cloud_input_qos,
+            callback_group=self.processing_callback_group,
         )
         self.object_sub = self.create_subscription(
             PointCloud2,
             object_input,
             lambda msg: self._cloud_callback(msg, self.object_pub, "object"),
-            sensor_qos,
+            cloud_input_qos,
+            callback_group=self.processing_callback_group,
         )
         self.json_sub = self.create_subscription(
             String,
             json_input,
             self._json_callback,
             json_input_qos,
+            callback_group=self.processing_callback_group,
         )
 
         self._last_warning_ns: Dict[str, int] = {}
@@ -153,7 +190,9 @@ class AiFrameTransformNode(Node):
             f"target_frame={self.target_frame}, "
             f"clouds=({background_input}, {object_input}), "
             f"json={json_input}, "
-            f"json_position={self.json_camera_position_key}"
+            f"json_position={self.json_camera_position_key}, "
+            f"use_latest_tf_only={self.use_latest_tf_only}, "
+            "executor_threads=2"
         )
 
     @staticmethod
@@ -175,6 +214,19 @@ class AiFrameTransformNode(Node):
         stamp: Time,
     ) -> TransformStamped:
         source_frame = self._normalize_frame(source_frame)
+
+        # 정지 상태 스캔용 모드. 정확한 메시지 시각의 TF를 기다리지 않고
+        # 버퍼에 존재하는 최신 TF를 바로 사용한다. 긴 대기로 콜백이 밀리지
+        # 않도록 latest lookup은 최대 0.05초만 기다린다.
+        if self.use_latest_tf_only:
+            latest_timeout_sec = min(self.tf_timeout_sec, 0.05)
+            return self.tf_buffer.lookup_transform(
+                self.target_frame,
+                source_frame,
+                Time(),
+                timeout=Duration(seconds=latest_timeout_sec),
+            )
+
         try:
             return self.tf_buffer.lookup_transform(
                 self.target_frame,
@@ -192,11 +244,12 @@ class AiFrameTransformNode(Node):
                 "fallback_to_latest_tf=true. Use this only while the robot is stopped.",
                 period_sec=5.0,
             )
+            latest_timeout_sec = min(self.tf_timeout_sec, 0.05)
             return self.tf_buffer.lookup_transform(
                 self.target_frame,
                 source_frame,
                 Time(),
-                timeout=Duration(seconds=self.tf_timeout_sec),
+                timeout=Duration(seconds=latest_timeout_sec),
             )
 
     def _cloud_callback(self, msg: PointCloud2, publisher, label: str) -> None:
@@ -263,7 +316,7 @@ class AiFrameTransformNode(Node):
 
         stamp = self._json_stamp_to_time(payload.get("stamp"))
         if stamp is None:
-            if not self.fallback_to_latest_tf:
+            if not self.use_latest_tf_only and not self.fallback_to_latest_tf:
                 self._warn_throttled(
                     "json_stamp",
                     "The JSON stamp is missing or invalid and "
@@ -433,11 +486,19 @@ class AiFrameTransformNode(Node):
 def main(args: Optional[List[str]] = None) -> None:
     rclpy.init(args=args)
     node = AiFrameTransformNode()
+
+    # PointCloud 변환 콜백이 TF를 기다리거나 변환 연산을 수행하는 동안에도
+    # /tf 및 /tf_static 구독 콜백을 처리할 수 있도록 2개 스레드를 사용한다.
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
+
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.remove_node(node)
+        executor.shutdown()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

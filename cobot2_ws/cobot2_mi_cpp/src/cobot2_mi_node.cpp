@@ -9,12 +9,14 @@
 // 역할:
 //   cobot2_grasp.py가 DSR ikin까지 통과시켜 발행한 ValidatedGrasp를
 //   구독 → MoveIt Cartesian 경로계획(pre_grasp → grasp 직선 접근)
-//   → 성공 시 /motion_plan(JSON) 발행, 실패 시 /grasp_result(JSON) 발행
+//   → 성공 시 /motion_plan(JSON) 발행
+//   → 실패 시 /grasp/retry_request로 다음 후보 요청
+//   → 모든 후보 소진 시 최종 /grasp_result는 cobot2_grasp.py가 발행
 //
 // ROS 인터페이스:
 //   SUB  /grasp/validated_grasp  (cobot2_interfaces/msg/ValidatedGrasp)
 //   PUB  /motion_plan            (std_msgs/String, JSON)
-//   PUB  /grasp_result           (std_msgs/String, JSON)  ← 실패 시
+//   PUB  /grasp/retry_request    (std_msgs/String, JSON)
 // ============================================================
 
 #include <memory>
@@ -24,6 +26,7 @@
 #include <cmath>
 #include <algorithm>
 #include <iterator>
+#include <mutex>
 
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/string.hpp"
@@ -42,7 +45,7 @@ using moveit::planning_interface::MoveGroupInterface;
 namespace {
 constexpr double kCartesianStepM = 0.005;   // Cartesian 경로 해상도 (5mm)
 constexpr double kCartesianMinFrac = 0.95;  // 최소 경로 완성률 (95%)
-constexpr double kPlanningTimeSec = 5.0;
+constexpr double kPlanningTimeSec = 2.0;
 constexpr double kVelocityScaling = 0.3;
 constexpr double kAccelScaling = 0.3;
 const char* kPlanningGroup = "manipulator";
@@ -60,10 +63,10 @@ struct ShelfBox
 };
 
 constexpr ShelfBox kShelfBoxes[] = {
-  {"shelf_floor", 0.57, -0.48, 0.00, 1.01, 0.305, 0.01},
-  {"shelf_back",  0.57, -0.48, 0.24, 1.01, 0.305, 0.01},
-  {"shelf_left", -0.04, -0.47, 0.12, 0.50, 0.020, 0.24},
-  {"shelf_right", 0.92, -0.47, 0.12, 0.50, 0.020, 0.24},
+  {"shelf_floor", 0.37, -0.48, -0.01, 1.01, 0.305, 0.01},
+  // {"shelf_back",  0.37, -0.48, 0.215, 1.01, 0.305, 0.01},
+  // {"shelf_left", -0.04, -0.47, 0.12, 0.50, 0.020, 0.24},
+  // {"shelf_right", 0.92, -0.47, 0.12, 0.50, 0.020, 0.24},
 };
 }  // namespace
 
@@ -73,7 +76,7 @@ public:
   Cobot2MiNode() : Node("cobot2_mi")
   {
     pub_plan_ = create_publisher<std_msgs::msg::String>("/motion_plan", 10);
-    pub_result_ = create_publisher<std_msgs::msg::String>("/grasp_result", 10);
+    pub_retry_ = create_publisher<std_msgs::msg::String>("/grasp/retry_request", 10);
 
     sub_ = create_subscription<ValidatedGrasp>(
       "/grasp/validated_grasp", 10,
@@ -90,6 +93,7 @@ public:
       move_group_ = std::make_shared<MoveGroupInterface>(
         shared_from_this(), kPlanningGroup);
       move_group_->setPlanningTime(kPlanningTimeSec);
+      move_group_->setNumPlanningAttempts(1);
       move_group_->setMaxVelocityScalingFactor(kVelocityScaling);
       move_group_->setMaxAccelerationScalingFactor(kAccelScaling);
       move_group_->setStartStateToCurrentState();
@@ -207,6 +211,13 @@ private:
     // grasp_joints(float64[6])를 vector로 변환
     // — DSR ikin으로 이미 검증된 관절값, cobot2_move.py가 movej에 바로 사용
     std::vector<double> joints(msg.grasp_joints.begin(), msg.grasp_joints.end());
+    std::vector<double> pre_joints(
+      msg.pre_grasp_joints.begin(), msg.pre_grasp_joints.end());
+
+    if (joints.size() != 6 || pre_joints.size() != 6) {
+      requestNextCandidate(msg, "IK 관절값 배열이 6축이 아님");
+      return;
+    }
 
     if (!move_group_ready_) {
       RCLCPP_WARN(get_logger(), "MoveIt 없음 — 관절값만 전달");
@@ -216,6 +227,11 @@ private:
 
     std::lock_guard<std::mutex> lock(plan_mutex_);
 
+    // 후보마다 실제 최신 관절상태에서 다시 계획한다. 이전 후보의
+    // pose/joint target이 남아 다음 후보에 섞이지 않도록 target도 초기화한다.
+    move_group_->clearPoseTargets();
+    move_group_->setStartStateToCurrentState();
+
     // 1단계: pre-grasp 위치로 경로 계획
     // ★ 수정: setPoseTarget() 대신 setJointValueTarget() 사용.
     // pre_grasp_joints는 grasp.py에서 DSR ikin(해석적 solver)으로
@@ -223,9 +239,6 @@ private:
     // 같은 pose에 대해 IK를 다시 계산하다 실패하는 경우가 많으므로
     // (Unable to sample any valid states) pose 기반 목표 대신
     // 이미 풀린 관절값으로 직접 목표를 설정해 이 문제를 회피한다.
-    std::vector<double> pre_joints(
-      msg.pre_grasp_joints.begin(), msg.pre_grasp_joints.end());
-
     bool success_pre = false;
     MoveGroupInterface::Plan plan_to_pre;
 
@@ -235,7 +248,11 @@ private:
       for (double d : pre_joints) {
         pre_joints_rad.push_back(d * M_PI / 180.0);
       }
-      move_group_->setJointValueTarget(pre_joints_rad);
+      if (!move_group_->setJointValueTarget(pre_joints_rad)) {
+        requestNextCandidate(
+          msg, grasp_type + " pre-grasp 관절 목표가 MoveIt 제한 밖");
+        return;
+      }
       success_pre = (move_group_->plan(plan_to_pre) ==
         moveit::core::MoveItErrorCode::SUCCESS);
     } else {
@@ -249,7 +266,7 @@ private:
     if (!success_pre) {
       std::string reason = grasp_type + " pre-grasp 계획 실패 (충돌 또는 워크스페이스 밖)";
       RCLCPP_ERROR(get_logger(), "%s", reason.c_str());
-      publishFail(msg, reason);
+      requestNextCandidate(msg, reason);
       return;
     }
 
@@ -277,7 +294,11 @@ private:
       std::vector<double> joints_rad;
       for (double d : joints) {joints_rad.push_back(d * M_PI / 180.0);}
 
-      move_group_->setJointValueTarget(joints_rad);
+      if (!move_group_->setJointValueTarget(joints_rad)) {
+        requestNextCandidate(
+          msg, grasp_type + " grasp 관절 목표가 MoveIt 제한 밖");
+        return;
+      }
       MoveGroupInterface::Plan plan_to_grasp;
       bool success_grasp = (move_group_->plan(plan_to_grasp) ==
         moveit::core::MoveItErrorCode::SUCCESS);
@@ -285,7 +306,7 @@ private:
       if (!success_grasp) {
         std::string reason = grasp_type + " grasp 관절공간 계획도 실패 (충돌 가능성)";
         RCLCPP_ERROR(get_logger(), "%s", reason.c_str());
-        publishFail(msg, reason);
+        requestNextCandidate(msg, reason);
         return;
       }
 
@@ -359,18 +380,45 @@ private:
     RCLCPP_INFO(get_logger(), "[%s] /motion_plan 발행 완료", msg.grasp_type.c_str());
   }
 
-  // ── /grasp_result 발행 (실패) ────────────────────────────────────────
-  void publishFail(const ValidatedGrasp & msg, const std::string & reason)
+  // ── 다음 후보 요청 ─────────────────────────────────────────────
+  // 현재 후보의 MoveIt 계획이 실패해도 즉시 전체 작업 실패를 발행하지 않는다.
+  // grasp 노드가 미리 준비한 다음 기하학 후보/solution space를 발행하도록 요청한다.
+  void requestNextCandidate(
+    const ValidatedGrasp & msg,
+    const std::string & reason)
   {
     std::ostringstream oss;
     oss << "{"
-        << "\"grasp_type\":\"" << msg.grasp_type << "\","
-        << "\"success\":false,"
-        << "\"reason\":\"" << reason << "\""
+        << "\"grasp_type\":\"" << jsonEscape(msg.grasp_type) << "\","
+        << "\"stamp_sec\":" << msg.header.stamp.sec << ","
+        << "\"stamp_nanosec\":" << msg.header.stamp.nanosec << ","
+        << "\"reason\":\"" << jsonEscape(reason) << "\""
         << "}";
+
     std_msgs::msg::String out;
     out.data = oss.str();
-    pub_result_->publish(out);
+    pub_retry_->publish(out);
+
+    RCLCPP_WARN(
+      get_logger(),
+      "[%s] MoveIt 계획 실패 → 다음 후보 요청: %s",
+      msg.grasp_type.c_str(), reason.c_str());
+  }
+
+  static std::string jsonEscape(const std::string & input)
+  {
+    std::ostringstream oss;
+    for (const char ch : input) {
+      switch (ch) {
+        case '\\': oss << "\\\\"; break;
+        case '"': oss << "\\\""; break;
+        case '\n': oss << "\\n"; break;
+        case '\r': oss << "\\r"; break;
+        case '\t': oss << "\\t"; break;
+        default: oss << ch; break;
+      }
+    }
+    return oss.str();
   }
 
   // ── 헬퍼: 관절값 배열 → JSON 배열 문자열 ────────────────────────────
@@ -412,7 +460,7 @@ private:
 
   rclcpp::Subscription<ValidatedGrasp>::SharedPtr sub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_plan_;
-  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_result_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_retry_;
   std::shared_ptr<MoveGroupInterface> move_group_;
   moveit::planning_interface::PlanningSceneInterface planning_scene_interface_;
   bool move_group_ready_ {false};
