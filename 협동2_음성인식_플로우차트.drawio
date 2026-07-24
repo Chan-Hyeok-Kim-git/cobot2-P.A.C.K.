@@ -1,0 +1,189 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Page-1" id="8xc34TNaowrbWrfu9HJh">
+    <mxGraphModel grid="1" page="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-4" edge="1" parent="1" source="6yoj_Jpxeja_Bnifuyxm-1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="6yoj_Jpxeja_Bnifuyxm-3" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-1" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="&lt;div&gt;시작&lt;/div&gt;" vertex="1">
+          <mxGeometry height="60" width="120" x="40" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-8" edge="1" parent="1" source="6yoj_Jpxeja_Bnifuyxm-3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" value="">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="100" y="260" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-3" parent="1" style="ellipse;whiteSpace=wrap;html=1;shapeInside=1;" value="voice_command&lt;br&gt;node 실행" vertex="1">
+          <mxGeometry height="80" width="120" x="40" y="140" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-6" edge="1" parent="1" source="6yoj_Jpxeja_Bnifuyxm-5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" value="">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="100" y="480" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-5" parent="1" style="ellipse;whiteSpace=wrap;html=1;shapeInside=1;" value="재난 방송 재생" vertex="1">
+          <mxGeometry height="80" width="120" x="-130" y="440" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-15" edge="1" parent="1" source="6yoj_Jpxeja_Bnifuyxm-9" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="6yoj_Jpxeja_Bnifuyxm-14" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-16" connectable="0" parent="6yoj_Jpxeja_Bnifuyxm-15" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" value="True" vertex="1">
+          <mxGeometry relative="1" x="0.15" as="geometry">
+            <mxPoint y="7" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-9" parent="1" style="rhombus;whiteSpace=wrap;html=1;shapeInside=1;" value="Wakeup1&lt;br&gt;단어가&amp;nbsp;&lt;br&gt;들어왔나?" vertex="1">
+          <mxGeometry height="80" width="140" x="30" y="380" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-11" edge="1" parent="1" source="6yoj_Jpxeja_Bnifuyxm-10" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="6yoj_Jpxeja_Bnifuyxm-9" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-10" parent="1" style="ellipse;whiteSpace=wrap;html=1;shapeInside=1;" value="Wakeup1 단어 들어올 때까지 대기" vertex="1">
+          <mxGeometry height="80" width="120" x="40" y="260" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-12" edge="1" parent="1" source="6yoj_Jpxeja_Bnifuyxm-9" style="endArrow=classic;html=1;rounded=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;exitX=0;exitY=0.5;exitDx=0;exitDy=0;" target="6yoj_Jpxeja_Bnifuyxm-10" value="">
+          <mxGeometry height="50" relative="1" width="50" as="geometry">
+            <Array as="points">
+              <mxPoint y="420" />
+              <mxPoint y="300" />
+            </Array>
+            <mxPoint x="400" y="340" as="sourcePoint" />
+            <mxPoint x="450" y="290" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-13" connectable="0" parent="6yoj_Jpxeja_Bnifuyxm-12" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" value="&lt;div&gt;False&lt;/div&gt;" vertex="1">
+          <mxGeometry relative="1" x="-0.18" y="-3" as="geometry">
+            <mxPoint x="-3" y="54" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-18" edge="1" parent="1" source="6yoj_Jpxeja_Bnifuyxm-14" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="6yoj_Jpxeja_Bnifuyxm-17" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-14" parent="1" style="ellipse;whiteSpace=wrap;html=1;shapeInside=1;" value="재난 방송 5초간 녹음" vertex="1">
+          <mxGeometry height="80" width="120" x="40" y="500" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-20" edge="1" parent="1" source="6yoj_Jpxeja_Bnifuyxm-17" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="6yoj_Jpxeja_Bnifuyxm-19" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-17" parent="1" style="ellipse;whiteSpace=wrap;html=1;shapeInside=1;" value="&lt;div&gt;STT로 재난 방송&amp;nbsp;&lt;br&gt;텍스트화&lt;/div&gt;" vertex="1">
+          <mxGeometry height="80" width="120" x="240" y="500" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-22" edge="1" parent="1" source="6yoj_Jpxeja_Bnifuyxm-19" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="6yoj_Jpxeja_Bnifuyxm-21" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-19" parent="1" style="ellipse;whiteSpace=wrap;html=1;shapeInside=1;align=center;fontSize=11;" value="&lt;div&gt;&lt;font&gt;텍스트화 한&amp;nbsp;&lt;br&gt;&lt;/font&gt;&lt;/div&gt;&lt;font&gt;재난방송에서&amp;nbsp;&lt;br&gt;재난 유형&amp;nbsp;&lt;br&gt;파싱해 추출&lt;/font&gt;" vertex="1">
+          <mxGeometry height="80" width="120" x="240" y="380" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-24" edge="1" parent="1" source="6yoj_Jpxeja_Bnifuyxm-21" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="6yoj_Jpxeja_Bnifuyxm-23" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-21" parent="1" style="ellipse;whiteSpace=wrap;html=1;shapeInside=1;fontSize=11;" value="&lt;font&gt;재난 유형에 따른&amp;nbsp;&lt;br&gt;물품 리스트를&amp;nbsp;&lt;br&gt;String 토픽으로 발행&lt;/font&gt;" vertex="1">
+          <mxGeometry height="80" width="120" x="240" y="260" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-26" edge="1" parent="1" source="6yoj_Jpxeja_Bnifuyxm-23" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="6yoj_Jpxeja_Bnifuyxm-25" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-23" parent="1" style="ellipse;whiteSpace=wrap;html=1;shapeInside=1;" value="Wakeup2 단어&amp;nbsp;&lt;br&gt;들어올 때까지대기" vertex="1">
+          <mxGeometry height="80" width="120" x="240" y="140" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-30" edge="1" parent="1" source="6yoj_Jpxeja_Bnifuyxm-25" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="6yoj_Jpxeja_Bnifuyxm-29" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-31" connectable="0" parent="6yoj_Jpxeja_Bnifuyxm-30" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" value="True" vertex="1">
+          <mxGeometry relative="1" x="-0.3455" y="4" as="geometry">
+            <mxPoint y="4" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-25" parent="1" style="rhombus;whiteSpace=wrap;html=1;shapeInside=1;" value="Wakeup2&lt;br&gt;단어가&amp;nbsp;&lt;br&gt;들어왔나?" vertex="1">
+          <mxGeometry height="80" width="140" x="230" y="30" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-27" edge="1" parent="1" source="6yoj_Jpxeja_Bnifuyxm-25" style="endArrow=classic;html=1;rounded=0;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="6yoj_Jpxeja_Bnifuyxm-23" value="">
+          <mxGeometry height="50" relative="1" width="50" as="geometry">
+            <Array as="points">
+              <mxPoint x="200" y="70" />
+              <mxPoint x="200" y="180" />
+            </Array>
+            <mxPoint x="400" y="340" as="sourcePoint" />
+            <mxPoint x="450" y="290" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-28" connectable="0" parent="6yoj_Jpxeja_Bnifuyxm-27" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" value="&lt;div&gt;False&lt;/div&gt;" vertex="1">
+          <mxGeometry relative="1" x="-0.4667" as="geometry">
+            <mxPoint x="10" y="-18" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-36" edge="1" parent="1" source="6yoj_Jpxeja_Bnifuyxm-29" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="6yoj_Jpxeja_Bnifuyxm-35" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-29" parent="1" style="ellipse;whiteSpace=wrap;html=1;shapeInside=1;" value="사람 목소리&amp;nbsp;&lt;br&gt;5초간 녹음" vertex="1">
+          <mxGeometry height="80" width="120" x="440" y="30" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-33" edge="1" parent="1" source="6yoj_Jpxeja_Bnifuyxm-32" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" value="">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="375" y="70" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-34" connectable="0" parent="6yoj_Jpxeja_Bnifuyxm-33" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" value="&quot;Hello ROKEY&quot;" vertex="1">
+          <mxGeometry relative="1" x="-0.1833" y="-2" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-32" parent="1" style="shape=umlActor;verticalLabelPosition=bottom;verticalAlign=top;html=1;outlineConnect=0;" value="Actor" vertex="1">
+          <mxGeometry height="60" width="30" x="360" y="-110" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-38" edge="1" parent="1" source="6yoj_Jpxeja_Bnifuyxm-40" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="6yoj_Jpxeja_Bnifuyxm-37" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-44" connectable="0" parent="6yoj_Jpxeja_Bnifuyxm-38" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" value="True" vertex="1">
+          <mxGeometry relative="1" x="-0.5" y="-4" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-35" parent="1" style="ellipse;whiteSpace=wrap;html=1;shapeInside=1;" value="STT로 사람 목소리&amp;nbsp;&lt;br&gt;텍스트화" vertex="1">
+          <mxGeometry height="80" width="120" x="440" y="140" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-46" edge="1" parent="1" source="6yoj_Jpxeja_Bnifuyxm-37" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="6yoj_Jpxeja_Bnifuyxm-45" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-37" parent="1" style="ellipse;whiteSpace=wrap;html=1;shapeInside=1;" value="텍스트에서 물품 이름 파싱해 추출" vertex="1">
+          <mxGeometry height="80" width="120" x="440" y="380" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-41" edge="1" parent="1" source="6yoj_Jpxeja_Bnifuyxm-35" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="6yoj_Jpxeja_Bnifuyxm-40" value="">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="500" y="220" as="sourcePoint" />
+            <mxPoint x="500" y="380" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-40" parent="1" style="rhombus;whiteSpace=wrap;html=1;shapeInside=1;fontSize=10;" value="&lt;font&gt;텍스트에&amp;nbsp;&lt;br&gt;물품 리스트에 있는&amp;nbsp;&lt;br&gt;물품이 있나?&lt;/font&gt;" vertex="1">
+          <mxGeometry height="80" width="140" x="430" y="260" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-42" edge="1" parent="1" source="6yoj_Jpxeja_Bnifuyxm-40" style="endArrow=classic;html=1;rounded=0;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" target="6yoj_Jpxeja_Bnifuyxm-23" value="">
+          <mxGeometry height="50" relative="1" width="50" as="geometry">
+            <Array as="points">
+              <mxPoint x="400" y="300" />
+              <mxPoint x="400" y="180" />
+            </Array>
+            <mxPoint x="400" y="280" as="sourcePoint" />
+            <mxPoint x="450" y="230" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-43" connectable="0" parent="6yoj_Jpxeja_Bnifuyxm-42" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" value="False" vertex="1">
+          <mxGeometry relative="1" x="-0.9187" y="-1" as="geometry">
+            <mxPoint x="-12" y="1" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-48" edge="1" parent="1" source="6yoj_Jpxeja_Bnifuyxm-45" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="6yoj_Jpxeja_Bnifuyxm-47" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-45" parent="1" style="ellipse;whiteSpace=wrap;html=1;shapeInside=1;" value="물품 이름 String 토픽으로 발행" vertex="1">
+          <mxGeometry height="80" width="120" x="440" y="500" as="geometry" />
+        </mxCell>
+        <mxCell id="6yoj_Jpxeja_Bnifuyxm-47" parent="1" style="whiteSpace=wrap;html=1;" value="종료" vertex="1">
+          <mxGeometry height="60" width="120" x="640" y="510" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
