@@ -1,0 +1,13 @@
+yolo_object_detector:
+  ros__parameters:
+    model_path: ""
+    image_topic: "/camera/camera/color/image_raw"
+    annotated_topic: "/ai/detections/image"
+    detections_topic: "/ai/detections/json"
+    confidence: 0.4
+    iou: 0.7
+    image_size: 640
+    device: "0"
+    process_every_n: 1
+    capture_root: "dataset/detection_captures"
+    log_period_sec: 5.0
