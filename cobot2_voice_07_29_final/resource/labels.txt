@@ -1,0 +1,2 @@
+0 Disaster_situation
+1 배경 소음
